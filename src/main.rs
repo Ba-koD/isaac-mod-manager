@@ -1,9 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // Hide console window on Windows in release
 
-mod github;
 mod fs_utils;
-mod patcher;
 mod gui;
+mod patcher;
+mod steam_api;
+mod steam_workshop;
 
 use anyhow::Result;
 

@@ -1,0 +1,5 @@
+[alias]
+check-local = "check --locked"
+test-local = "test --locked"
+build-local = "build --release --locked"
+run-local = "run"
