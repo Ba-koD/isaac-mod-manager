@@ -37,27 +37,36 @@ impl Patcher {
         self
     }
 
-    pub fn sync_from_source_dir<F>(&self, source_dir: &Path, logger: Option<F>) -> Result<()>
+    pub fn sync_from_source_dir_with_progress<F, P>(
+        &self,
+        source_dir: &Path,
+        logger: Option<F>,
+        progress: Option<P>,
+    ) -> Result<()>
     where
         F: Fn(String),
+        P: Fn(f32, String),
     {
-        self.sync_from_source_dir_with_logger(
+        self.sync_from_source_dir_with_logger_and_progress(
             source_dir,
             logger.as_ref().map(|f| f as &dyn Fn(String)),
+            progress.as_ref().map(|f| f as &dyn Fn(f32, String)),
         )
     }
 
-    fn sync_from_source_dir_with_logger(
+    fn sync_from_source_dir_with_logger_and_progress(
         &self,
         source_dir: &Path,
         logger: Option<&dyn Fn(String)>,
+        progress: Option<&dyn Fn(f32, String)>,
     ) -> Result<()> {
         log(
             logger,
             "Step 1/3: Checking installed version...".to_string(),
         );
+        report_progress(progress, 5.0, "Checking installed version");
         let local_version = self.read_local_version(logger);
-        self.sync_source_with_local_version(source_dir, local_version, logger)
+        self.sync_source_with_local_version(source_dir, local_version, logger, progress)
     }
 
     fn read_local_version(&self, logger: Option<&dyn Fn(String)>) -> Option<String> {
@@ -82,11 +91,13 @@ impl Patcher {
         workshop_path: &Path,
         local_version: Option<String>,
         logger: Option<&dyn Fn(String)>,
+        progress: Option<&dyn Fn(f32, String)>,
     ) -> Result<()> {
         log(
             logger,
             "Step 3/4: Reading downloaded workshop metadata...".to_string(),
         );
+        report_progress(progress, 15.0, "Reading workshop metadata");
         let workshop_metadata = read_local_metadata(workshop_path)?;
         let workshop_version = workshop_metadata
             .as_ref()
@@ -95,6 +106,7 @@ impl Patcher {
         match (local_version.as_deref(), workshop_version.as_deref()) {
             (Some(local), Some(remote)) if local == remote && !self.force_update => {
                 log(logger, format!("Already up to date (version {}).", local));
+                report_progress(progress, 100.0, "Already up to date");
                 Ok(())
             }
             (Some(local), Some(remote)) if local == remote => {
@@ -105,7 +117,7 @@ impl Patcher {
                         local
                     ),
                 );
-                self.sync_from_dir(workshop_path, logger)
+                self.sync_from_dir(workshop_path, logger, progress)
             }
             (Some(local), Some(remote))
                 if !self.allow_downgrade
@@ -126,39 +138,44 @@ impl Patcher {
                         remote
                     ),
                 );
-                self.sync_from_dir(workshop_path, logger)
+                self.sync_from_dir(workshop_path, logger, progress)
             }
             (_, None) => {
                 log(
                     logger,
                     "Workshop metadata has no version; syncing downloaded content.".to_string(),
                 );
-                self.sync_from_dir(workshop_path, logger)
+                self.sync_from_dir(workshop_path, logger, progress)
             }
         }
     }
 
-    fn sync_from_dir(&self, source_dir: &Path, logger: Option<&dyn Fn(String)>) -> Result<()> {
+    fn sync_from_dir(
+        &self,
+        source_dir: &Path,
+        logger: Option<&dyn Fn(String)>,
+        progress: Option<&dyn Fn(f32, String)>,
+    ) -> Result<()> {
         log(
             logger,
             "Step 4/4: Applying downloaded files to selected mod folder...".to_string(),
         );
+        report_progress(progress, 25.0, "Applying files");
 
         let mut processed_files = HashSet::new();
-        for entry in walkdir::WalkDir::new(source_dir)
+        let source_files = walkdir::WalkDir::new(source_dir)
             .into_iter()
             .filter_map(|entry| entry.ok())
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
+            .filter(|entry| entry.file_type().is_file())
+            .filter_map(|entry| {
+                let source_path = entry.path().to_path_buf();
+                let relative_path = source_path.strip_prefix(source_dir).ok()?.to_path_buf();
+                (!should_skip(&relative_path)).then_some((source_path, relative_path))
+            })
+            .collect::<Vec<_>>();
+        let total_files = source_files.len().max(1);
 
-            let source_path = entry.path();
-            let relative_path = source_path.strip_prefix(source_dir)?;
-            if should_skip(relative_path) {
-                continue;
-            }
-
+        for (file_index, (source_path, relative_path)) in source_files.iter().enumerate() {
             let target_path = self.mod_path.join(relative_path);
             processed_files.insert(target_path.clone());
 
@@ -179,12 +196,20 @@ impl Patcher {
                 }
                 fs::write(&target_path, content)?;
             }
+
+            let percent = 25.0 + ((file_index + 1) as f32 / total_files as f32) * 65.0;
+            report_progress(
+                progress,
+                percent,
+                format!("Applying {}/{} files", file_index + 1, total_files),
+            );
         }
 
         log(
             logger,
             "Cleaning up files removed from workshop content...".to_string(),
         );
+        report_progress(progress, 92.0, "Cleaning removed files");
         for entry in walkdir::WalkDir::new(&self.mod_path)
             .into_iter()
             .filter_map(|entry| entry.ok())
@@ -210,6 +235,7 @@ impl Patcher {
         }
 
         log(logger, "Update complete!".to_string());
+        report_progress(progress, 100.0, "Update complete");
         Ok(())
     }
 }
@@ -228,6 +254,16 @@ fn log(logger: Option<&dyn Fn(String)>, msg: String) {
         f(msg.clone());
     }
     println!("{}", msg);
+}
+
+fn report_progress(
+    progress: Option<&dyn Fn(f32, String)>,
+    percent: f32,
+    detail: impl Into<String>,
+) {
+    if let Some(progress) = progress {
+        progress(percent.clamp(0.0, 100.0), detail.into());
+    }
 }
 
 fn read_local_metadata(root: &Path) -> Result<Option<LocalMetadata>> {

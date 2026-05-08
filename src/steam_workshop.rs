@@ -61,24 +61,16 @@ impl SteamWorkshopClient {
     }
 
     pub fn download_latest(&self, logger: Option<&dyn Fn(String)>) -> Result<PathBuf> {
-        if !self.force_download {
-            if let Some(path) =
-                find_cached_workshop_item(self.app_id, self.workshop_id, &self.steam_library_roots)
-            {
-                log(
-                    logger,
-                    format!(
-                        "Using Steam client workshop cache: {}",
-                        path.to_string_lossy()
-                    ),
-                );
-                return Ok(path);
-            }
-        } else {
-            log(
-                logger,
-                "Force update enabled; refreshing Workshop content before applying.".to_string(),
-            );
+        if let Some(path) =
+            find_cached_workshop_item(self.app_id, self.workshop_id, &self.steam_library_roots)
+        {
+            let action = if self.force_download {
+                "Force update enabled; using Steam client workshop cache and verifying all files"
+            } else {
+                "Using Steam client workshop cache"
+            };
+            log(logger, format!("{}: {}", action, path.to_string_lossy()));
+            return Ok(path);
         }
 
         log(
@@ -331,13 +323,21 @@ fn run_steamcmd_streaming(
     args: Vec<String>,
     logger: Option<&dyn Fn(String)>,
 ) -> Result<String> {
-    let mut child = Command::new(steamcmd)
+    let mut command = Command::new(steamcmd);
+    command
         .current_dir(steamcmd_dir)
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to run steamcmd")?;
+        .stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = command.spawn().context("Failed to run steamcmd")?;
 
     let (tx, rx) = mpsc::channel();
     let mut readers = Vec::new();

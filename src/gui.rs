@@ -23,6 +23,10 @@ const APP_TITLE: &str = "Isaac Mod Manager";
 const MIN_VISIBLE_WIDTH: f32 = 1040.0;
 const MIN_VISIBLE_HEIGHT: f32 = 780.0;
 const DESCRIPTION_MIN_HEIGHT: f32 = 280.0;
+const ACTIONS_PANEL_HEIGHT: f32 = 58.0;
+const LOG_PANEL_MIN_HEIGHT: f32 = 90.0;
+const LOG_PANEL_DEFAULT_HEIGHT: f32 = 180.0;
+const LOG_PANEL_MAX_HEIGHT: f32 = 230.0;
 const SINGLE_STEAM_CLIENT_WAIT_SECS: u64 = 20;
 const BULK_STEAM_CLIENT_WAIT_SECS: u64 = 20;
 const SETTINGS_REGISTRY_KEY: &str = "Software\\Ba-koD\\isaac_mod_manager";
@@ -88,6 +92,27 @@ struct PendingSubscribeNotice {
     workshop_id: u64,
 }
 
+#[derive(Clone, Debug)]
+struct UpdateProgress {
+    total: usize,
+    completed: usize,
+    current_mod: Option<String>,
+    current_detail: Option<String>,
+    current_percent: f32,
+}
+
+impl Default for UpdateProgress {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            completed: 0,
+            current_mod: None,
+            current_detail: None,
+            current_percent: 0.0,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct UpdateTarget {
     path: PathBuf,
@@ -147,29 +172,10 @@ impl InstalledMod {
     }
 
     fn row_label(&self, language: UiLanguage) -> String {
-        let marker = if let Some(workshop_id) = self.workshop_id {
-            format!(" | Workshop {}", workshop_id)
-        } else {
-            format!(" | {}", tr(language, "local_only"))
-        };
-        let steam_version = self
-            .steam_version
-            .as_deref()
-            .map(|version| format!(" | Steam {}", version))
-            .or_else(|| {
-                self.steam_updated_at
-                    .map(|timestamp| format!(" | Steam {}", format_timestamp(Some(timestamp))))
-            })
-            .unwrap_or_default();
         format!(
-            "[{}] {} | {} {}{} | {}{}",
+            "[{}] {}",
             self.update_status.label(language),
-            self.display_name(),
-            tr(language, "local_short"),
-            self.version_label(),
-            steam_version,
-            self.folder_name,
-            marker
+            self.display_name()
         )
     }
 }
@@ -256,9 +262,12 @@ pub struct PatcherApp {
     state: AppState,
     status_message: String,
     progress_log: Arc<Mutex<Vec<String>>>,
+    update_progress: Arc<Mutex<UpdateProgress>>,
     app_id: u32,
     auto_update_enabled: bool,
     auto_update_exclusions: HashSet<u64>,
+    checked_update_paths: HashSet<PathBuf>,
+    update_selection_touched: bool,
     force_update_enabled: bool,
     show_log: bool,
     language_mode: LanguageMode,
@@ -290,9 +299,12 @@ impl Default for PatcherApp {
             state: AppState::Idle,
             status_message: tr(language, "ready").to_string(),
             progress_log: Arc::new(Mutex::new(Vec::new())),
+            update_progress: Arc::new(Mutex::new(UpdateProgress::default())),
             app_id: ISAAC_APP_ID,
             auto_update_enabled: load_auto_update().unwrap_or(true),
             auto_update_exclusions: load_auto_update_exclusions().unwrap_or_default(),
+            checked_update_paths: HashSet::new(),
+            update_selection_touched: false,
             force_update_enabled: false,
             show_log: false,
             language_mode,
@@ -351,6 +363,7 @@ impl PatcherApp {
 
         let steam_roots = self.steam_library_roots();
         self.available_mods = scan_installed_mods(&mods_path, self.app_id, &steam_roots);
+        self.sync_checked_update_selection();
         let restored_selection = previous_selected_path
             .as_ref()
             .and_then(|path| {
@@ -562,7 +575,7 @@ impl PatcherApp {
     }
 
     fn update_all_indices(&self, force_update: bool) -> Vec<usize> {
-        self.update_all_eligible_indices()
+        self.checked_update_indices()
             .into_iter()
             .filter(|index| {
                 force_update
@@ -576,16 +589,43 @@ impl PatcherApp {
             .collect()
     }
 
-    fn update_all_eligible_indices(&self) -> Vec<usize> {
+    fn checked_update_indices(&self) -> Vec<usize> {
         self.available_mods
             .iter()
             .enumerate()
             .filter_map(|(index, installed_mod)| {
-                let workshop_id = valid_workshop_id(installed_mod.workshop_id?)?;
-                (workshop_id > 0 && !self.auto_update_exclusions.contains(&workshop_id))
-                    .then_some(index)
+                self.can_batch_update_mod(installed_mod)
+                    .then_some(())
+                    .and_then(|_| {
+                        self.checked_update_paths
+                            .contains(&installed_mod.path)
+                            .then_some(index)
+                    })
             })
             .collect()
+    }
+
+    fn can_batch_update_mod(&self, installed_mod: &InstalledMod) -> bool {
+        let Some(workshop_id) = installed_mod.workshop_id.and_then(valid_workshop_id) else {
+            return false;
+        };
+        !self.auto_update_exclusions.contains(&workshop_id)
+    }
+
+    fn sync_checked_update_selection(&mut self) {
+        let eligible_paths = self
+            .available_mods
+            .iter()
+            .filter(|installed_mod| self.can_batch_update_mod(installed_mod))
+            .map(|installed_mod| installed_mod.path.clone())
+            .collect::<HashSet<_>>();
+
+        self.checked_update_paths
+            .retain(|path| eligible_paths.contains(path));
+
+        if !self.update_selection_touched {
+            self.checked_update_paths = eligible_paths;
+        }
     }
 
     fn auto_update_indices(&self) -> Vec<usize> {
@@ -608,6 +648,11 @@ impl PatcherApp {
     fn set_auto_update_excluded(&mut self, workshop_id: u64, excluded: bool) {
         if excluded {
             self.auto_update_exclusions.insert(workshop_id);
+            for installed_mod in &self.available_mods {
+                if installed_mod.workshop_id == Some(workshop_id) {
+                    self.checked_update_paths.remove(&installed_mod.path);
+                }
+            }
         } else {
             self.auto_update_exclusions.remove(&workshop_id);
         }
@@ -659,6 +704,7 @@ impl PatcherApp {
         }
 
         let log = self.progress_log.clone();
+        let update_progress = self.update_progress.clone();
         let app_id = self.app_id;
         let steam_library_roots = self.steam_library_roots();
         let steam_client_wait = if group_count > 1 || target_count > 1 {
@@ -682,6 +728,7 @@ impl PatcherApp {
             }
             l.push("Running updates asynchronously.".to_string());
         }
+        reset_update_progress(&update_progress, target_count);
 
         thread::spawn(move || {
             let (result_tx, result_rx) = mpsc::channel();
@@ -691,6 +738,7 @@ impl PatcherApp {
                 let result_tx = result_tx.clone();
                 let steam_library_roots = steam_library_roots.clone();
                 let steamcmd_lock = steamcmd_lock.clone();
+                let update_progress = update_progress.clone();
 
                 thread::spawn(move || {
                     let group_target_count = group.targets.len();
@@ -703,6 +751,12 @@ impl PatcherApp {
                             group_target_count
                         ));
                     }
+                    set_update_progress(
+                        &update_progress,
+                        format!("Workshop {}", group.workshop_id),
+                        5.0,
+                        "Downloading workshop content",
+                    );
 
                     let client = SteamWorkshopClient::new(app_id, group.workshop_id)
                         .with_steam_library_roots(steam_library_roots)
@@ -728,6 +782,12 @@ impl PatcherApp {
                             return;
                         }
                     };
+                    set_update_progress(
+                        &update_progress,
+                        format!("Workshop {}", group.workshop_id),
+                        25.0,
+                        "Workshop content ready",
+                    );
 
                     for target in group.targets {
                         if let Ok(mut l) = log.lock() {
@@ -749,10 +809,23 @@ impl PatcherApp {
                                 l.push(format!("{}: {}", display_name, msg));
                             }
                         };
+                        let progress_for_target = update_progress.clone();
+                        let progress_name = target.display_name.clone();
+                        let progress = move |percent: f32, detail: String| {
+                            set_update_progress(
+                                &progress_for_target,
+                                progress_name.clone(),
+                                percent,
+                                detail,
+                            );
+                        };
 
-                        let had_error = if let Err(error) =
-                            patcher.sync_from_source_dir(&source_path, Some(logger))
-                        {
+                        let had_error = if let Err(error) = patcher
+                            .sync_from_source_dir_with_progress(
+                                &source_path,
+                                Some(logger),
+                                Some(progress),
+                            ) {
                             if let Ok(mut l) = log.lock() {
                                 l.push(format!("{}: Error: {}", target.display_name, error));
                             }
@@ -772,6 +845,7 @@ impl PatcherApp {
             for (completed_delta, worker_had_error) in result_rx {
                 completed_count += completed_delta;
                 had_error |= worker_had_error;
+                mark_update_completed(&update_progress, completed_count);
                 if let Ok(mut l) = log.lock() {
                     l.push(format!(
                         "Completed {}/{} update jobs.",
@@ -869,19 +943,28 @@ impl PatcherApp {
                 });
         });
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label(path_label);
-            if let Some(path) = &self.game_path {
-                ui.add(egui::Label::new(path.to_string_lossy()).wrap(true));
-            } else {
-                ui.colored_label(egui::Color32::from_rgb(200, 80, 80), not_selected_label);
-            }
-        });
+        egui::Grid::new("top_status_grid")
+            .num_columns(2)
+            .spacing([10.0, 5.0])
+            .show(ui, |ui| {
+                ui.label(path_label);
+                if let Some(path) = &self.game_path {
+                    ui.add(egui::Label::new(path.to_string_lossy()).wrap(true));
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(200, 80, 80), not_selected_label);
+                }
+                ui.end_row();
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label(status_label);
-            ui.add(egui::Label::new(self.current_status_text()).wrap(true));
-        });
+                ui.label(status_label);
+                ui.add(egui::Label::new(self.current_status_text()).wrap(true));
+                ui.end_row();
+
+                if self.should_show_update_progress() {
+                    ui.label(self.t("progress"));
+                    self.render_update_progress(ui);
+                    ui.end_row();
+                }
+            });
     }
 
     fn current_status_text(&self) -> String {
@@ -897,6 +980,47 @@ impl PatcherApp {
         };
 
         status_sentence(selected, self.language())
+    }
+
+    fn should_show_update_progress(&self) -> bool {
+        self.update_progress
+            .lock()
+            .map(|progress| progress.total > 0)
+            .unwrap_or(false)
+    }
+
+    fn render_update_progress(&self, ui: &mut egui::Ui) {
+        let progress = self
+            .update_progress
+            .lock()
+            .map(|progress| progress.clone())
+            .unwrap_or_default();
+        if progress.total == 0 {
+            return;
+        }
+
+        let total_fraction = (progress.completed as f32 / progress.total as f32).clamp(0.0, 1.0);
+        ui.vertical(|ui| {
+            ui.add(egui::ProgressBar::new(total_fraction).text(format!(
+                "{}: {}/{} ({:.0}%)",
+                self.t("overall_progress"),
+                progress.completed,
+                progress.total,
+                total_fraction * 100.0
+            )));
+
+            if let Some(current_mod) = progress.current_mod.as_deref() {
+                let current_fraction = (progress.current_percent / 100.0).clamp(0.0, 1.0);
+                let detail = progress.current_detail.as_deref().unwrap_or_default();
+                ui.add(egui::ProgressBar::new(current_fraction).text(format!(
+                    "{}: {} {:.0}% {}",
+                    self.t("current_mod_progress"),
+                    current_mod,
+                    progress.current_percent,
+                    detail
+                )));
+            }
+        });
     }
 
     fn render_mod_browser(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -945,6 +1069,8 @@ impl PatcherApp {
                         for index in &visible_indices {
                             let installed_mod = &self.available_mods[*index];
                             let selected = self.selected_mod_index == Some(*index);
+                            let path = installed_mod.path.clone();
+                            let can_batch_update = self.can_batch_update_mod(installed_mod);
                             let mut label = installed_mod.row_label(language);
                             if installed_mod.workshop_id.is_some_and(|workshop_id| {
                                 self.is_auto_update_excluded(workshop_id)
@@ -954,9 +1080,25 @@ impl PatcherApp {
                             }
                             let text = egui::RichText::new(label)
                                 .color(installed_mod.update_status.color());
-                            if ui.selectable_label(selected, text).clicked() {
-                                clicked_mod_index = Some(*index);
-                            }
+                            ui.horizontal(|ui| {
+                                let mut checked = self.checked_update_paths.contains(&path);
+                                let checkbox_response = ui.add_enabled(
+                                    can_batch_update,
+                                    egui::Checkbox::without_text(&mut checked),
+                                );
+                                if checkbox_response.changed() {
+                                    self.update_selection_touched = true;
+                                    if checked {
+                                        self.checked_update_paths.insert(path.clone());
+                                    } else {
+                                        self.checked_update_paths.remove(&path);
+                                    }
+                                }
+
+                                if ui.selectable_label(selected, text).clicked() {
+                                    clicked_mod_index = Some(*index);
+                                }
+                            });
                         }
                     });
             });
@@ -1363,7 +1505,7 @@ impl PatcherApp {
                         self.start_patching();
                     }
 
-                    let can_update_all = !self.update_all_eligible_indices().is_empty();
+                    let can_update_all = !self.checked_update_indices().is_empty();
                     let update_all_indices = self.update_all_indices(self.force_update_enabled);
                     if ui
                         .add_enabled(
@@ -1786,19 +1928,28 @@ impl eframe::App for PatcherApp {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
 
-        egui::TopBottomPanel::bottom("actions_log_panel")
+        egui::TopBottomPanel::bottom("actions_panel")
             .resizable(false)
+            .exact_height(ACTIONS_PANEL_HEIGHT)
             .show(ctx, |ui| {
                 ui.add_space(6.0);
                 self.render_update_controls(ui);
-
-                if self.show_log {
-                    ui.add_space(6.0);
-                    ui.separator();
-                    self.render_log(ui, 170.0);
-                }
                 ui.add_space(6.0);
             });
+
+        if self.show_log {
+            egui::TopBottomPanel::bottom("log_panel")
+                .resizable(true)
+                .default_height(LOG_PANEL_DEFAULT_HEIGHT)
+                .height_range(LOG_PANEL_MIN_HEIGHT..=LOG_PANEL_MAX_HEIGHT)
+                .show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    let log_height = (ui.available_height() - 24.0)
+                        .clamp(LOG_PANEL_MIN_HEIGHT - 24.0, LOG_PANEL_MAX_HEIGHT - 24.0);
+                    self.render_log(ui, log_height);
+                    ui.add_space(4.0);
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_top_bar(ui);
@@ -2028,6 +2179,41 @@ fn render_description_text_box(
         });
 }
 
+fn reset_update_progress(progress: &Arc<Mutex<UpdateProgress>>, total: usize) {
+    if let Ok(mut progress) = progress.lock() {
+        *progress = UpdateProgress {
+            total,
+            completed: 0,
+            current_mod: None,
+            current_detail: None,
+            current_percent: 0.0,
+        };
+    }
+}
+
+fn set_update_progress(
+    progress: &Arc<Mutex<UpdateProgress>>,
+    current_mod: String,
+    current_percent: f32,
+    current_detail: impl Into<String>,
+) {
+    if let Ok(mut progress) = progress.lock() {
+        progress.current_mod = Some(current_mod);
+        progress.current_percent = current_percent.clamp(0.0, 100.0);
+        progress.current_detail = Some(current_detail.into());
+    }
+}
+
+fn mark_update_completed(progress: &Arc<Mutex<UpdateProgress>>, completed: usize) {
+    if let Ok(mut progress) = progress.lock() {
+        progress.completed = completed.min(progress.total);
+        if progress.completed >= progress.total {
+            progress.current_percent = 100.0;
+            progress.current_detail = Some("Update complete".to_string());
+        }
+    }
+}
+
 fn update_action_button(label: &str, width: f32, force_update: bool) -> egui::Button<'_> {
     let button = if force_update {
         egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE))
@@ -2238,6 +2424,9 @@ fn tr(language: UiLanguage, key: &'static str) -> &'static str {
             "path" => "경로",
             "not_selected" => "선택 안 됨",
             "status" => "상태",
+            "progress" => "진행",
+            "overall_progress" => "전체",
+            "current_mod_progress" => "현재 모드",
             "installed_mods" => "설치된 모드:",
             "refresh_mods" => "새로고침",
             "search" => "검색",
@@ -2343,6 +2532,9 @@ fn tr(language: UiLanguage, key: &'static str) -> &'static str {
             "path" => "Path",
             "not_selected" => "Not selected",
             "status" => "Status",
+            "progress" => "Progress",
+            "overall_progress" => "Overall",
+            "current_mod_progress" => "Current mod",
             "installed_mods" => "Installed Mods:",
             "refresh_mods" => "Refresh Mods",
             "search" => "Search",
