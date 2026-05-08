@@ -39,7 +39,7 @@ To test and launch the app after building:
 Release binary:
 
 ```text
-target\release\isaac_mod_manager.exe
+target\release\isaac-mod-manager.exe
 ```
 
 If SteamCMD is not available on `PATH`, the app downloads Valve's SteamCMD into:

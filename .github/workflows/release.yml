@@ -18,8 +18,8 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: isaac_mod_manager.exe
-            asset_name: cb_patcher-windows.exe
+            artifact_name: isaac-mod-manager.exe
+            asset_name: isaac-mod-manager-windows.exe
 
     steps:
     - uses: actions/checkout@v3
