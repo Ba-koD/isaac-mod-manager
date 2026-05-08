@@ -1406,19 +1406,22 @@ impl PatcherApp {
         ui.label(self.t("log"));
 
         let logs = self.progress_log.lock().unwrap();
-        egui::ScrollArea::vertical()
-            .id_source("progress_log_scroll")
-            .max_height(height)
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for log in logs.iter() {
-                    if parse_subscribe_notice_marker(log).is_some() {
-                        continue;
-                    }
-                    ui.monospace(log);
-                }
-            });
+        let mut text = logs
+            .iter()
+            .filter(|log| parse_subscribe_notice_marker(log).is_none())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.add_sized(
+            [ui.available_width(), height],
+            egui::TextEdit::multiline(&mut text)
+                .id_source("progress_log_text")
+                .font(egui::TextStyle::Monospace)
+                .desired_rows(8)
+                .interactive(true)
+                .lock_focus(true)
+                .desired_width(f32::INFINITY),
+        );
     }
 
     fn render_confirmation_dialog(&mut self, ctx: &egui::Context) {
@@ -1727,6 +1730,7 @@ impl PatcherApp {
 
         if last == "Update complete!" {
             self.state = AppState::Done;
+            self.pending_subscribe_notice = None;
             self.refresh_mods();
             self.state = AppState::Done;
             self.status_message = self.t("update_success").to_string();

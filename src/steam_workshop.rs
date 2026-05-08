@@ -138,15 +138,27 @@ impl SteamWorkshopClient {
             unreachable!("SteamCMD success path returns before reaching client fallback");
         }
 
+        if let Some(path) =
+            find_cached_workshop_item(self.app_id, self.workshop_id, &self.steam_library_roots)
+        {
+            log(
+                logger,
+                format!(
+                    "SteamCMD failed, but Steam client workshop cache is available: {}",
+                    path.display()
+                ),
+            );
+            return Ok(path);
+        }
+
         log(
             logger,
             "SteamCMD anonymous download failed. Opening the Workshop page in the logged-in Steam client...".to_string(),
         );
         open_workshop_page(self.workshop_id, logger)?;
-        log(logger, format!("SUBSCRIBE_REQUIRED:{}", self.workshop_id));
         log(
             logger,
-            "Subscribe/download the item in Steam if needed. Waiting for Steam client workshop cache...".to_string(),
+            "Waiting for Steam client workshop cache. If the item is already subscribed, wait for Steam downloads to finish.".to_string(),
         );
         if let Some(path) = wait_for_steam_client_cache(
             self.app_id,
@@ -158,6 +170,7 @@ impl SteamWorkshopClient {
             return Ok(path);
         }
 
+        log(logger, format!("SUBSCRIBE_REQUIRED:{}", self.workshop_id));
         Err(anyhow::anyhow!(
             "Steam client workshop cache was not found yet. Make sure the logged-in Steam account can access this item, subscribe/download it in Steam, wait for downloads to finish, then retry."
         ))

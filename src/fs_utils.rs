@@ -133,26 +133,40 @@ fn read_libraryfolders_vdf(steam_root: &PathBuf) -> Vec<PathBuf> {
         return Vec::new();
     };
 
-    content
-        .lines()
-        .filter_map(parse_library_path_line)
-        .map(PathBuf::from)
+    let mut roots = Vec::new();
+    for line in content.lines() {
+        let quoted = quoted_vdf_fields(line);
+        if quoted.len() != 2 {
+            continue;
+        }
+
+        let key = &quoted[0];
+        let value = &quoted[1];
+        if key == "path" {
+            roots.push(PathBuf::from(normalize_vdf_path(value)));
+        } else if key.chars().all(|ch| ch.is_ascii_digit()) {
+            {
+                let path = PathBuf::from(normalize_vdf_path(value));
+                if path.join("steamapps").exists() || path.join("workshop").exists() {
+                    roots.push(path);
+                }
+            }
+        }
+    }
+
+    roots
+}
+
+fn quoted_vdf_fields(line: &str) -> Vec<String> {
+    line.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(ToOwned::to_owned)
         .collect()
 }
 
-fn parse_library_path_line(line: &str) -> Option<String> {
-    let line = line.trim();
-    if !line.starts_with("\"path\"") {
-        return None;
-    }
-
-    let mut quoted = line.split('"').filter(|part| !part.is_empty());
-    let key = quoted.next()?;
-    if key != "path" {
-        return None;
-    }
-    let value = quoted.next()?;
-    Some(value.replace("\\\\", "\\"))
+fn normalize_vdf_path(value: &str) -> String {
+    value.replace("\\\\", "\\")
 }
 
 fn dedup_existing_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
