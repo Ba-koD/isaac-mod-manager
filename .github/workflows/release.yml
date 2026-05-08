@@ -19,7 +19,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: isaac_mod_manager.exe
-            asset_name: isaac_mod_manager-windows.exe
+            asset_name: cb_patcher-windows.exe
 
     steps:
     - uses: actions/checkout@v3
@@ -58,3 +58,4 @@ jobs:
         tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
         name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Latest Build' }}
         prerelease: false
+        overwrite_files: true
