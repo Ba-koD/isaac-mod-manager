@@ -1,3 +1,4 @@
+use crate::app_update::{self, ReleaseUpdate};
 use crate::fs_utils::{find_isaac_game_path, find_steam_library_roots};
 use crate::patcher::Patcher;
 use crate::steam_api::{fetch_workshop_details, fetch_workshop_summaries, WorkshopDetails};
@@ -22,10 +23,11 @@ use std::time::{Duration, UNIX_EPOCH};
 
 const SUPPORTED_MOD_DIRECTORY: &str = "conch_blessing";
 const APP_TITLE: &str = "Isaac Mod Manager";
-const MIN_VISIBLE_WIDTH: f32 = 1040.0;
-const MIN_VISIBLE_HEIGHT: f32 = 780.0;
-const DESCRIPTION_MIN_HEIGHT: f32 = 280.0;
-const ACTIONS_PANEL_HEIGHT: f32 = 58.0;
+const MIN_VISIBLE_WIDTH: f32 = 900.0;
+const MIN_VISIBLE_HEIGHT: f32 = 640.0;
+const DESCRIPTION_FONT_SIZE: f32 = 14.5;
+const DESCRIPTION_HEADING_FONT_SIZE: f32 = 17.0;
+const ACTIONS_PANEL_HEIGHT: f32 = 56.0;
 const LOG_PANEL_MIN_HEIGHT: f32 = 90.0;
 const LOG_PANEL_DEFAULT_HEIGHT: f32 = 180.0;
 const LOG_PANEL_MAX_HEIGHT: f32 = 230.0;
@@ -58,9 +60,20 @@ enum AppState {
 }
 
 #[derive(Clone, Debug)]
+enum AppUpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(ReleaseUpdate),
+    Installing,
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
 struct InstalledMod {
     path: PathBuf,
     folder_name: String,
+    enabled: bool,
     name: Option<String>,
     version: Option<String>,
     description: Option<String>,
@@ -281,8 +294,15 @@ pub struct PatcherApp {
     details_cache: Arc<Mutex<HashMap<u64, WorkshopDetailsState>>>,
     preview_textures: HashMap<u64, egui::TextureHandle>,
     preview_failures: HashSet<u64>,
+    description_image_textures: HashMap<String, egui::TextureHandle>,
+    description_image_failures: HashMap<String, String>,
+    description_image_loading: HashSet<String>,
+    description_image_results: Arc<Mutex<HashMap<String, Result<Vec<u8>, String>>>>,
     dependency_check: Arc<Mutex<DependencyCheckState>>,
     show_dependency_check: bool,
+    app_update: Arc<Mutex<AppUpdateState>>,
+    show_app_update_dialog: bool,
+    app_update_notice_seen: bool,
 }
 
 impl Default for PatcherApp {
@@ -318,8 +338,15 @@ impl Default for PatcherApp {
             details_cache: Arc::new(Mutex::new(HashMap::new())),
             preview_textures: HashMap::new(),
             preview_failures: HashSet::new(),
+            description_image_textures: HashMap::new(),
+            description_image_failures: HashMap::new(),
+            description_image_loading: HashSet::new(),
+            description_image_results: Arc::new(Mutex::new(HashMap::new())),
             dependency_check: Arc::new(Mutex::new(DependencyCheckState::NotRun)),
             show_dependency_check: false,
+            app_update: Arc::new(Mutex::new(AppUpdateState::Idle)),
+            show_app_update_dialog: false,
+            app_update_notice_seen: false,
         };
 
         if let Some(path) = load_config() {
@@ -335,6 +362,7 @@ impl Default for PatcherApp {
                 app.start_auto_update();
             }
         }
+        app.start_app_update_check(false);
 
         app
     }
@@ -365,6 +393,7 @@ impl PatcherApp {
 
         let steam_roots = self.steam_library_roots();
         self.available_mods = scan_installed_mods(&mods_path, self.app_id, &steam_roots);
+        self.sort_available_mods();
         self.sync_checked_update_selection();
         let restored_selection = previous_selected_path
             .as_ref()
@@ -486,6 +515,36 @@ impl PatcherApp {
         }
     }
 
+    fn toggle_selected_mod_enabled(&mut self) {
+        if let Some(index) = self.selected_mod_index {
+            self.toggle_mod_enabled(index);
+        }
+    }
+
+    fn toggle_mod_enabled(&mut self, index: usize) {
+        let Some(installed_mod) = self.available_mods.get(index) else {
+            return;
+        };
+        let enabled = !installed_mod.enabled;
+        if let Err(error) = set_mod_enabled(&installed_mod.path, enabled) {
+            self.status_message = format!("{}: {}", self.t("toggle_mod_failed"), error);
+            return;
+        }
+
+        let display_name = if let Some(installed_mod) = self.available_mods.get_mut(index) {
+            installed_mod.enabled = enabled;
+            installed_mod.display_name().to_string()
+        } else {
+            return;
+        };
+
+        self.status_message = if enabled {
+            format!("{}: {}", self.t("mod_enabled"), display_name)
+        } else {
+            format!("{}: {}", self.t("mod_disabled"), display_name)
+        };
+    }
+
     fn open_dependency_check(&mut self) {
         if self.dependency_check_is_checking() {
             self.show_dependency_check = true;
@@ -515,6 +574,66 @@ impl PatcherApp {
             .lock()
             .map(|state| matches!(&*state, DependencyCheckState::Checking))
             .unwrap_or(false)
+    }
+
+    fn start_app_update_check(&mut self, manual: bool) {
+        if self
+            .app_update
+            .lock()
+            .map(|state| {
+                matches!(
+                    &*state,
+                    AppUpdateState::Checking | AppUpdateState::Installing
+                )
+            })
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        if manual {
+            self.show_app_update_dialog = false;
+            self.app_update_notice_seen = false;
+        }
+
+        if let Ok(mut state) = self.app_update.lock() {
+            *state = AppUpdateState::Checking;
+        }
+
+        let state = self.app_update.clone();
+        thread::spawn(move || {
+            let next_state = match app_update::check_latest_release() {
+                Ok(Some(update)) => AppUpdateState::Available(update),
+                Ok(None) => AppUpdateState::UpToDate,
+                Err(error) => AppUpdateState::Error(error.to_string()),
+            };
+            if let Ok(mut state) = state.lock() {
+                *state = next_state;
+            }
+        });
+    }
+
+    fn start_app_update_install(&mut self, update: ReleaseUpdate) {
+        if let Ok(mut state) = self.app_update.lock() {
+            *state = AppUpdateState::Installing;
+        }
+        self.show_app_update_dialog = true;
+
+        let state = self.app_update.clone();
+        thread::spawn(move || {
+            if let Err(error) = app_update::install_and_restart(&update) {
+                if let Ok(mut state) = state.lock() {
+                    *state = AppUpdateState::Error(error.to_string());
+                }
+            }
+        });
+    }
+
+    fn app_update_state(&self) -> AppUpdateState {
+        self.app_update
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_else(|_| AppUpdateState::Error("Update state is unavailable".to_string()))
     }
 
     fn start_patching(&mut self) {
@@ -614,6 +733,19 @@ impl PatcherApp {
         !self.auto_update_exclusions.contains(&workshop_id)
     }
 
+    fn sort_available_mods(&mut self) {
+        let exclusions = self.auto_update_exclusions.clone();
+        self.available_mods.sort_by(|left, right| {
+            auto_update_exclusion_priority(left, &exclusions)
+                .cmp(&auto_update_exclusion_priority(right, &exclusions))
+                .then_with(|| {
+                    update_status_priority(&left.update_status)
+                        .cmp(&update_status_priority(&right.update_status))
+                })
+                .then_with(|| left.display_name().cmp(right.display_name()))
+        });
+    }
+
     fn sync_checked_update_selection(&mut self) {
         let eligible_paths = self
             .available_mods
@@ -648,6 +780,9 @@ impl PatcherApp {
     }
 
     fn set_auto_update_excluded(&mut self, workshop_id: u64, excluded: bool) {
+        let selected_path = self
+            .selected_mod()
+            .map(|installed_mod| installed_mod.path.clone());
         if excluded {
             self.auto_update_exclusions.insert(workshop_id);
             for installed_mod in &self.available_mods {
@@ -659,6 +794,13 @@ impl PatcherApp {
             self.auto_update_exclusions.remove(&workshop_id);
         }
         let _ = save_auto_update_exclusions(&self.auto_update_exclusions);
+        self.sort_available_mods();
+        if let Some(selected_path) = selected_path {
+            self.selected_mod_index = self
+                .available_mods
+                .iter()
+                .position(|installed_mod| installed_mod.path == selected_path);
+        }
     }
 
     fn start_patching_indices(
@@ -727,6 +869,7 @@ impl PatcherApp {
             l.push(format!("Unique Workshop items: {}", group_count));
             if force_update {
                 l.push("Force update enabled: all files will be verified.".to_string());
+                l.push("Local disable.it markers will be preserved.".to_string());
             }
             l.push("Running updates asynchronously.".to_string());
         }
@@ -911,8 +1054,11 @@ impl PatcherApp {
         let path_label = self.t("path");
         let not_selected_label = self.t("not_selected");
         let status_label = self.t("status");
+        ui.horizontal(|ui| {
+            ui.heading(format!("{} v{}", APP_TITLE, app_update::CURRENT_VERSION));
+        });
+        ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
-            ui.heading(APP_TITLE);
             if ui.button(game_folder_label).clicked() {
                 self.pick_game_folder();
             }
@@ -943,6 +1089,8 @@ impl PatcherApp {
                         }
                     }
                 });
+            ui.separator();
+            self.render_app_update_status(ui);
         });
 
         egui::Grid::new("top_status_grid")
@@ -967,6 +1115,53 @@ impl PatcherApp {
                     ui.end_row();
                 }
             });
+    }
+
+    fn render_app_update_status(&mut self, ui: &mut egui::Ui) {
+        let update_state = self.app_update_state();
+        match update_state {
+            AppUpdateState::Idle => {
+                if ui.button(self.t("check_app_update")).clicked() {
+                    self.start_app_update_check(true);
+                }
+            }
+            AppUpdateState::Checking => {
+                ui.spinner();
+                ui.label(self.t("checking_app_update"));
+            }
+            AppUpdateState::UpToDate => {
+                ui.label(self.t("app_up_to_date"));
+                if ui.button(self.t("check_app_update")).clicked() {
+                    self.start_app_update_check(true);
+                }
+            }
+            AppUpdateState::Available(update) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 140, 45),
+                    format!(
+                        "{} {}",
+                        self.t("app_update_available"),
+                        update.latest_version
+                    ),
+                );
+                if ui.button(self.t("install_app_update")).clicked() {
+                    self.start_app_update_install(update);
+                }
+            }
+            AppUpdateState::Installing => {
+                ui.spinner();
+                ui.label(self.t("installing_app_update"));
+            }
+            AppUpdateState::Error(error) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(210, 80, 80),
+                    format!("{}: {}", self.t("app_update_failed"), error),
+                );
+                if ui.button(self.t("retry_app_update")).clicked() {
+                    self.start_app_update_check(true);
+                }
+            }
+        }
     }
 
     fn current_status_text(&self) -> String {
@@ -1047,78 +1242,126 @@ impl PatcherApp {
             );
         });
 
-        let list_width = (ui.available_width() * 0.40).clamp(320.0, 480.0);
-        let browser_height = ui.available_height().max(240.0);
+        let browser_height = ui.available_height().max(260.0);
+        let list_height = if browser_height >= 560.0 {
+            (browser_height * 0.32).clamp(190.0, 300.0)
+        } else {
+            (browser_height * 0.36).clamp(160.0, 230.0)
+        };
+        let detail_height = (browser_height - list_height - 18.0).max(260.0);
         let visible_indices = self.filtered_mod_indices();
+        let enabled_indices = visible_indices
+            .iter()
+            .copied()
+            .filter(|index| {
+                self.available_mods
+                    .get(*index)
+                    .is_some_and(|installed_mod| installed_mod.enabled)
+            })
+            .collect::<Vec<_>>();
+        let disabled_indices = visible_indices
+            .iter()
+            .copied()
+            .filter(|index| {
+                self.available_mods
+                    .get(*index)
+                    .is_some_and(|installed_mod| !installed_mod.enabled)
+            })
+            .collect::<Vec<_>>();
         let mut clicked_mod_index = None;
+        let mut toggle_mod_index = None;
 
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width(list_width);
-                ui.set_min_height(browser_height);
-
-                egui::ScrollArea::vertical()
-                    .id_source("installed_mods_scroll")
-                    .max_height(browser_height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if self.available_mods.is_empty() {
-                            ui.label(no_mods_label);
-                        } else if visible_indices.is_empty() {
-                            ui.label(no_match_label);
-                        }
-
-                        for index in &visible_indices {
-                            let installed_mod = &self.available_mods[*index];
-                            let selected = self.selected_mod_index == Some(*index);
-                            let path = installed_mod.path.clone();
-                            let can_batch_update = self.can_batch_update_mod(installed_mod);
-                            let mut label = installed_mod.row_label(language);
-                            if installed_mod.workshop_id.is_some_and(|workshop_id| {
-                                self.is_auto_update_excluded(workshop_id)
-                            }) {
-                                label.push_str(" | ");
-                                label.push_str(tr(language, "auto_excluded_short"));
-                            }
-                            let text = egui::RichText::new(label)
-                                .color(installed_mod.update_status.color());
-                            ui.horizontal(|ui| {
-                                let mut checked = self.checked_update_paths.contains(&path);
-                                let checkbox_response = ui.add_enabled(
-                                    can_batch_update,
-                                    egui::Checkbox::without_text(&mut checked),
+        if self.available_mods.is_empty() {
+            ui.label(no_mods_label);
+        } else if visible_indices.is_empty() {
+            ui.label(no_match_label);
+        } else {
+            let list_inner_margin = 7.0;
+            let list_inner_height = (list_height - list_inner_margin * 2.0).max(120.0);
+            ui.columns(2, |columns| {
+                columns[0].set_min_height(list_height);
+                opaque_section_frame(&columns[0])
+                    .inner_margin(egui::Margin::same(list_inner_margin))
+                    .show(&mut columns[0], |ui| {
+                        ui.set_min_height(list_inner_height);
+                        egui::ScrollArea::vertical()
+                            .id_source("enabled_mods_scroll")
+                            .max_height(list_inner_height)
+                            .min_scrolled_height(list_inner_height)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_max_width(ui.available_width());
+                                self.render_mod_list_section(
+                                    ui,
+                                    language,
+                                    tr(language, "enabled_mods"),
+                                    tr(language, "no_enabled_mods"),
+                                    &enabled_indices,
+                                    &mut clicked_mod_index,
+                                    &mut toggle_mod_index,
                                 );
-                                if checkbox_response.changed() {
-                                    self.update_selection_touched = true;
-                                    if checked {
-                                        self.checked_update_paths.insert(path.clone());
-                                    } else {
-                                        self.checked_update_paths.remove(&path);
-                                    }
-                                }
-
-                                if ui.selectable_label(selected, text).clicked() {
-                                    clicked_mod_index = Some(*index);
-                                }
                             });
-                        }
+                    });
+
+                columns[1].set_min_height(list_height);
+                opaque_section_frame(&columns[1])
+                    .inner_margin(egui::Margin::same(list_inner_margin))
+                    .show(&mut columns[1], |ui| {
+                        ui.set_min_height(list_inner_height);
+                        egui::ScrollArea::vertical()
+                            .id_source("disabled_mods_scroll")
+                            .max_height(list_inner_height)
+                            .min_scrolled_height(list_inner_height)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_max_width(ui.available_width());
+                                self.render_mod_list_section(
+                                    ui,
+                                    language,
+                                    tr(language, "disabled_mods"),
+                                    tr(language, "no_disabled_mods"),
+                                    &disabled_indices,
+                                    &mut clicked_mod_index,
+                                    &mut toggle_mod_index,
+                                );
+                            });
                     });
             });
+        }
 
-            ui.separator();
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
 
-            ui.vertical(|ui| {
-                ui.set_min_width((ui.available_width()).max(260.0));
-                ui.set_height(browser_height);
-                egui::ScrollArea::vertical()
-                    .id_source("selected_mod_details_scroll")
-                    .max_height(browser_height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_min_width((ui.available_width()).max(260.0));
-                        self.render_selected_mod_details(ui, ctx, browser_height);
-                    });
-            });
+        let detail_height = detail_height.min(ui.available_height()).max(180.0);
+        let detail_inner_margin = 8.0;
+        let detail_inner_height = (detail_height - detail_inner_margin * 2.0).max(160.0);
+        let (detail_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), detail_height),
+            egui::Sense::hover(),
+        );
+        let detail_clip = detail_rect.intersect(ui.clip_rect());
+        ui.painter()
+            .rect_filled(detail_rect, egui::Rounding::ZERO, ui.visuals().panel_fill);
+        ui.painter().rect_stroke(
+            detail_rect,
+            egui::Rounding::ZERO,
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+        ui.allocate_ui_at_rect(detail_rect.shrink(detail_inner_margin), |ui| {
+            ui.set_clip_rect(detail_clip.shrink(detail_inner_margin));
+            ui.set_min_height(detail_inner_height);
+            ui.set_max_height(detail_inner_height);
+            egui::ScrollArea::vertical()
+                .id_source("selected_mod_details_scroll")
+                .max_height(detail_inner_height)
+                .min_scrolled_height(detail_inner_height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_clip_rect(ui.clip_rect().intersect(detail_clip));
+                    ui.set_min_width(ui.available_width());
+                    self.render_selected_mod_details(ui, ctx, detail_inner_height);
+                });
         });
 
         if let Some(index) = clicked_mod_index {
@@ -1128,6 +1371,100 @@ impl PatcherApp {
             }
             self.apply_selected_mod();
             self.ensure_selected_details_requested();
+        }
+        if let Some(index) = toggle_mod_index {
+            self.toggle_mod_enabled(index);
+        }
+    }
+
+    fn render_mod_list_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        language: UiLanguage,
+        title: &str,
+        empty_label: &str,
+        indices: &[usize],
+        clicked_mod_index: &mut Option<usize>,
+        toggle_mod_index: &mut Option<usize>,
+    ) {
+        ui.label(egui::RichText::new(format!("{} ({})", title, indices.len())).strong());
+        ui.label(
+            egui::RichText::new(tr(language, "update_checkbox_hint"))
+                .small()
+                .color(egui::Color32::from_rgb(135, 135, 135)),
+        );
+        if indices.is_empty() {
+            ui.label(
+                egui::RichText::new(empty_label).color(egui::Color32::from_rgb(145, 145, 145)),
+            );
+            return;
+        }
+
+        for index in indices {
+            let Some(installed_mod) = self.available_mods.get(*index) else {
+                continue;
+            };
+            let selected = self.selected_mod_index == Some(*index);
+            let path = installed_mod.path.clone();
+            let can_batch_update = self.can_batch_update_mod(installed_mod);
+            let label = installed_mod.row_label(language);
+            let auto_update_excluded = installed_mod
+                .workshop_id
+                .is_some_and(|workshop_id| self.is_auto_update_excluded(workshop_id));
+            let auto_update_off = installed_mod.workshop_id.is_some()
+                && (!self.auto_update_enabled || auto_update_excluded);
+            let state_prefix = if installed_mod.enabled {
+                tr(language, "enabled_short")
+            } else {
+                tr(language, "disabled_short")
+            };
+            let state_color = if installed_mod.enabled {
+                egui::Color32::from_rgb(80, 170, 100)
+            } else {
+                egui::Color32::from_rgb(220, 70, 70)
+            };
+            let status_color = installed_mod.update_status.color();
+            let auto_label = if auto_update_excluded {
+                Some(tr(language, "auto_excluded_short"))
+            } else if auto_update_off {
+                Some(tr(language, "auto_update_off_short"))
+            } else {
+                None
+            };
+            ui.horizontal(|ui| {
+                let mut checked = self.checked_update_paths.contains(&path);
+                let checkbox_response = ui
+                    .add_enabled(can_batch_update, egui::Checkbox::without_text(&mut checked))
+                    .on_hover_text(tr(language, "update_checkbox_hint"));
+                if checkbox_response.changed() {
+                    self.update_selection_touched = true;
+                    if checked {
+                        self.checked_update_paths.insert(path.clone());
+                    } else {
+                        self.checked_update_paths.remove(&path);
+                    }
+                }
+
+                let text = mod_row_text(
+                    ui,
+                    tr(language, "mod_state_short"),
+                    state_prefix,
+                    state_color,
+                    &label,
+                    status_color,
+                    auto_label,
+                );
+                let response = ui
+                    .selectable_label(selected, text)
+                    .on_hover_text(tr(language, "double_click_toggle_mod"));
+                if response.clicked() {
+                    *clicked_mod_index = Some(*index);
+                }
+                if response.double_clicked() {
+                    *clicked_mod_index = Some(*index);
+                    *toggle_mod_index = Some(*index);
+                }
+            });
         }
     }
 
@@ -1146,116 +1483,90 @@ impl PatcherApp {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        max_height: f32,
+        _max_height: f32,
     ) {
         let language = self.language();
         let Some(selected) = self.selected_mod().cloned() else {
             ui.label(self.t("select_mod"));
             return;
         };
+        let details_state = selected.workshop_id.and_then(|workshop_id| {
+            self.details_cache
+                .lock()
+                .ok()
+                .and_then(|cache| cache.get(&workshop_id).cloned())
+        });
 
-        let detail_start_y = ui.cursor().top();
-        ui.heading(selected.display_name());
-        egui::Grid::new("selected_mod_local_details")
-            .num_columns(2)
-            .spacing([10.0, 6.0])
-            .show(ui, |ui| {
-                ui.label(self.t("folder"));
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(&selected.folder_name);
-                    if ui.button(self.t("open_folder")).clicked() {
-                        match open_folder(&selected.path) {
-                            Ok(()) => {
-                                self.status_message = self.t("opened_folder").to_string();
-                            }
-                            Err(error) => {
-                                self.status_message =
-                                    format!("{}: {}", self.t("open_folder_failed"), error);
-                            }
-                        }
-                    }
-                });
-                ui.end_row();
+        render_selected_title(ui, &selected, details_state.as_ref());
+        ui.add_space(4.0);
+        let clipped_available_rect = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+        let outer_width = clipped_available_rect.width().max(0.0);
+        let thumbnail_gap = 12.0;
+        let thumbnail_slot =
+            selected_thumbnail_slot_size(outer_width, thumbnail_gap, details_state.as_ref());
+        if let (Some(thumbnail_slot), Some(WorkshopDetailsState::Ready(details))) =
+            (thumbnail_slot, &details_state)
+        {
+            let row_rect = ui.available_rect_before_wrap();
+            let clip_rect = ui.clip_rect();
+            let row_top = row_rect.top();
+            let row_left = row_rect.left().max(clip_rect.left());
+            let row_right = row_rect.right().min(clip_rect.right());
+            let thumbnail_rect = egui::Rect::from_min_size(
+                egui::pos2((row_right - thumbnail_slot.x).max(row_left), row_top),
+                thumbnail_slot,
+            );
+            let summary_width = (thumbnail_rect.left() - row_left - thumbnail_gap).max(0.0);
+            let summary_rect = egui::Rect::from_min_size(
+                egui::pos2(row_left, row_top),
+                egui::vec2(summary_width, thumbnail_slot.y),
+            );
+            let summary_clip = egui::Rect::from_min_max(
+                egui::pos2(row_left, row_top),
+                egui::pos2(row_left + summary_width, ui.clip_rect().bottom()),
+            )
+            .intersect(ui.clip_rect());
 
-                ui.label(self.t("local_version"));
-                ui.label(selected.version_label());
-                ui.end_row();
-
-                ui.label(self.t("steam_version"));
-                ui.label(selected.steam_version.as_deref().unwrap_or("unknown"));
-                ui.end_row();
-
-                if let Some(timestamp) = selected.steam_updated_at {
-                    ui.label(self.t("steam_updated"));
-                    ui.label(format_timestamp(Some(timestamp)));
-                    ui.end_row();
-                }
-
-                ui.label(self.t("version_status"));
-                ui.colored_label(
-                    selected.update_status.color(),
-                    selected.update_status.label(language),
-                );
-                ui.end_row();
-
-                if let Some(author) = &selected.author {
-                    ui.label(self.t("author"));
-                    ui.label(author);
-                    ui.end_row();
-                }
-
-                ui.label(self.t("workshop_id"));
-                if let Some(workshop_id) = selected.workshop_id {
-                    ui.label(workshop_id.to_string());
-                } else {
-                    ui.colored_label(egui::Color32::from_rgb(230, 150, 50), self.t("local_only"));
-                }
-                ui.end_row();
-
-                if let Some(workshop_id) = selected.workshop_id {
-                    ui.label(self.t("auto_update"));
-                    let mut excluded = self.is_auto_update_excluded(workshop_id);
-                    if ui
-                        .checkbox(&mut excluded, self.t("exclude_auto_update"))
-                        .changed()
-                    {
-                        self.set_auto_update_excluded(workshop_id, excluded);
-                    }
-                    ui.end_row();
-                }
+            let summary_response = ui.allocate_ui_at_rect(summary_rect, |ui| {
+                ui.set_clip_rect(summary_clip);
+                ui.set_max_width(summary_width);
+                ui.set_min_width(summary_width);
+                self.render_selected_mod_summary(ui, &selected, language);
             });
+            ui.allocate_rect(thumbnail_rect, egui::Sense::hover());
+            self.paint_selected_thumbnail_rect(ui, ctx, details, thumbnail_rect);
+
+            let used_rect = egui::Rect::from_min_max(
+                egui::pos2(row_left, row_top),
+                egui::pos2(
+                    row_right,
+                    summary_response
+                        .response
+                        .rect
+                        .bottom()
+                        .max(thumbnail_rect.bottom()),
+                ),
+            );
+            ui.advance_cursor_after_rect(used_rect);
+        } else {
+            self.render_selected_mod_summary(ui, &selected, language);
+        }
 
         ui.add_space(8.0);
 
         let Some(workshop_id) = selected.workshop_id else {
             if let Some(description) = selected.description.as_deref() {
                 ui.label(egui::RichText::new(self.t("description")).strong());
-                let used_height = ui.cursor().top() - detail_start_y;
-                let description_height =
-                    (max_height - used_height - 10.0).max(DESCRIPTION_MIN_HEIGHT);
-                render_description_text_box(
-                    ui,
-                    ("local_description_scroll", selected.folder_name.as_str()),
-                    description,
-                    description_height,
-                );
+                render_description_text_box(ui, description);
             } else {
                 ui.label(self.t("no_workshop_id_meta"));
             }
             return;
         };
 
-        let details_state = self
-            .details_cache
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(&workshop_id).cloned());
-
         match details_state {
             Some(WorkshopDetailsState::Ready(details)) => {
-                let used_height = ui.cursor().top() - detail_start_y;
-                let workshop_height = (max_height - used_height).max(180.0);
-                self.render_workshop_details(ui, ctx, &details, workshop_height);
+                self.render_workshop_details(ui, ctx, &details);
             }
             Some(WorkshopDetailsState::Error(error)) => {
                 ui.colored_label(
@@ -1279,65 +1590,153 @@ impl PatcherApp {
         }
     }
 
+    fn render_selected_mod_summary(
+        &mut self,
+        ui: &mut egui::Ui,
+        selected: &InstalledMod,
+        language: UiLanguage,
+    ) {
+        ui.vertical(|ui| {
+            render_summary_row(ui, self.t("folder"), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(egui::Label::new(&selected.folder_name).wrap(true));
+                    if ui.button(self.t("open_folder")).clicked() {
+                        match open_folder(&selected.path) {
+                            Ok(()) => {
+                                self.status_message = self.t("opened_folder").to_string();
+                            }
+                            Err(error) => {
+                                self.status_message =
+                                    format!("{}: {}", self.t("open_folder_failed"), error);
+                            }
+                        }
+                    }
+                });
+            });
+
+            render_summary_row(ui, self.t("mod_state"), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let state_label = if selected.enabled {
+                        self.t("enabled")
+                    } else {
+                        self.t("disabled")
+                    };
+                    let state_color = if selected.enabled {
+                        egui::Color32::from_rgb(80, 170, 100)
+                    } else {
+                        egui::Color32::from_rgb(210, 120, 60)
+                    };
+                    ui.colored_label(state_color, state_label);
+                    let toggle_label = if selected.enabled {
+                        self.t("disable_mod")
+                    } else {
+                        self.t("enable_mod")
+                    };
+                    if ui.button(toggle_label).clicked() {
+                        self.toggle_selected_mod_enabled();
+                    }
+                });
+            });
+
+            render_summary_row(ui, self.t("version"), |ui| {
+                self.render_version_summary(ui, selected, language);
+            });
+
+            render_summary_row(ui, self.t("workshop_id"), |ui| {
+                if let Some(workshop_id) = selected.workshop_id {
+                    ui.label(workshop_id.to_string());
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(230, 150, 50), self.t("local_only"));
+                }
+            });
+
+            if let Some(workshop_id) = selected.workshop_id {
+                render_summary_row(ui, self.t("auto_update"), |ui| {
+                    let mut excluded = self.is_auto_update_excluded(workshop_id);
+                    if ui
+                        .checkbox(&mut excluded, self.t("exclude_auto_update"))
+                        .changed()
+                    {
+                        self.set_auto_update_excluded(workshop_id, excluded);
+                    }
+                });
+            }
+        });
+    }
+
+    fn render_version_summary(
+        &self,
+        ui: &mut egui::Ui,
+        selected: &InstalledMod,
+        language: UiLanguage,
+    ) {
+        let local = selected.version_label();
+        if let Some(steam) = selected.steam_version.as_deref() {
+            if local.trim() != steam.trim() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("{}:", tr(language, "current_version")));
+                    ui.colored_label(current_version_color(&selected.update_status), local);
+                    ui.label("/");
+                    ui.label(format!("{}:", tr(language, "steam_version_short")));
+                    ui.colored_label(egui::Color32::from_rgb(80, 170, 100), steam);
+                });
+                return;
+            }
+        }
+
+        let version = selected
+            .version
+            .as_deref()
+            .or(selected.steam_version.as_deref())
+            .unwrap_or("unknown");
+        let color = if selected.update_status == ModUpdateStatus::Latest {
+            egui::Color32::from_rgb(80, 170, 100)
+        } else {
+            selected.update_status.color()
+        };
+        ui.colored_label(color, version);
+    }
+
+    fn paint_selected_thumbnail_rect(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        details: &WorkshopDetails,
+        slot_rect: egui::Rect,
+    ) {
+        let clip_rect = slot_rect.intersect(ui.clip_rect());
+        if let Some(texture) = self.preview_texture(ctx, details).cloned() {
+            let texture_size = texture.size();
+            let original = egui::vec2(texture_size[0] as f32, texture_size[1] as f32);
+            let scale = (slot_rect.width() / original.x)
+                .min(slot_rect.height() / original.y)
+                .min(1.0);
+            let size = egui::vec2(original.x * scale, original.y * scale);
+            let image_rect = egui::Align2::CENTER_CENTER.align_size_within_rect(size, slot_rect);
+            ui.painter().with_clip_rect(clip_rect).image(
+                texture.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else if details.preview_url.is_some() {
+            ui.painter().with_clip_rect(clip_rect).text(
+                slot_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                tr(self.language(), "preview_unsupported"),
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_rgb(150, 150, 150),
+            );
+        }
+    }
+
     fn render_workshop_details(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         details: &WorkshopDetails,
-        max_height: f32,
     ) {
         let language = self.language();
-        let start_y = ui.cursor().top();
-        if let Some(texture) = self.preview_texture(ctx, details).cloned() {
-            let texture_size = texture.size();
-            let original = egui::vec2(texture_size[0] as f32, texture_size[1] as f32);
-            let max_width = ui.available_width().min(360.0);
-            let max_preview_height = (max_height * 0.34).clamp(120.0, 240.0);
-            let scale = (max_width / original.x).min(max_preview_height / original.y);
-            let size = egui::vec2(original.x * scale, original.y * scale);
-            ui.add(egui::Image::from_texture(&texture).fit_to_exact_size(size));
-            ui.add_space(6.0);
-        } else if details.preview_url.is_some() {
-            ui.colored_label(
-                egui::Color32::from_rgb(150, 150, 150),
-                tr(language, "preview_unsupported"),
-            );
-        }
-
-        ui.label(egui::RichText::new(&details.title).strong());
-        egui::Grid::new(("workshop_details_grid", details.workshop_id))
-            .num_columns(2)
-            .spacing([10.0, 5.0])
-            .show(ui, |ui| {
-                ui.label(tr(language, "steam_updated"));
-                ui.label(format_timestamp(details.time_updated));
-                ui.end_row();
-
-                ui.label(tr(language, "created"));
-                ui.label(format_timestamp(details.time_created));
-                ui.end_row();
-
-                ui.label(tr(language, "size"));
-                ui.label(format_bytes(details.file_size));
-                ui.end_row();
-
-                ui.label(tr(language, "views"));
-                ui.label(format_count(details.views));
-                ui.end_row();
-
-                ui.label(tr(language, "subscriptions"));
-                ui.label(format_count(details.subscriptions));
-                ui.end_row();
-
-                ui.label(tr(language, "favorites"));
-                ui.label(format_count(details.favorited));
-                ui.end_row();
-            });
-
-        self.render_workshop_creators(ui, details, language);
-        self.render_workshop_required_items(ui, details, language);
-        self.render_workshop_tags(ui, details, language);
-
         ui.horizontal_wrapped(|ui| {
             if ui.button(tr(language, "open_workshop_steam")).clicked() {
                 match open_workshop_in_steam(details.workshop_id) {
@@ -1358,15 +1757,332 @@ impl PatcherApp {
 
         ui.add_space(6.0);
         ui.label(egui::RichText::new(tr(language, "description")).strong());
-        let used_height = ui.cursor().top() - start_y;
-        let remaining_height = (max_height - used_height - 10.0).max(0.0);
-        let description_height = remaining_height.max(DESCRIPTION_MIN_HEIGHT);
-        render_description_text_box(
-            ui,
-            ("workshop_description_scroll", details.workshop_id),
-            &details.description,
-            description_height,
-        );
+        render_workshop_meta_line(ui, details, language);
+        ui.add_space(4.0);
+        self.render_steam_description_box(ui, ctx, &details.description);
+
+        self.render_workshop_creators(ui, details, language);
+        self.render_workshop_required_items(ui, details, language);
+        self.render_workshop_tags(ui, details, language);
+    }
+
+    fn render_steam_description_box(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, text: &str) {
+        let inner_margin = 10.0;
+        let content_width = (ui.available_width() - inner_margin * 2.0).max(120.0);
+        egui::Frame::group(ui.style())
+            .fill(ui.visuals().extreme_bg_color)
+            .inner_margin(egui::Margin::same(inner_margin))
+            .show(ui, |ui| {
+                ui.set_min_width(content_width);
+                let clip = ui.clip_rect();
+                ui.set_clip_rect(clip);
+                self.render_steam_description_content(ui, ctx, text, clip);
+            });
+    }
+
+    fn render_steam_description_content(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        text: &str,
+        clip_rect: egui::Rect,
+    ) {
+        let mut in_list = false;
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                ui.add_space(8.0);
+                continue;
+            }
+
+            let lower = line.to_ascii_lowercase();
+            if lower == "[list]" || lower == "[olist]" {
+                in_list = true;
+                continue;
+            }
+            if lower == "[/list]" || lower == "[/olist]" {
+                in_list = false;
+                continue;
+            }
+            if lower == "[hr]" {
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+                continue;
+            }
+
+            if let Some(image_url) = wrapped_bbcode_content(line, "img") {
+                self.render_description_image(
+                    ui,
+                    ctx,
+                    strip_bbcode_tags(image_url).trim(),
+                    None,
+                    clip_rect,
+                );
+                continue;
+            }
+
+            if let Some(heading) = wrapped_bbcode_content(line, "h1")
+                .or_else(|| wrapped_bbcode_content(line, "h2"))
+                .or_else(|| wrapped_bbcode_content(line, "h3"))
+            {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(bbcode_inline_to_text(heading))
+                            .strong()
+                            .size(DESCRIPTION_HEADING_FONT_SIZE),
+                    )
+                    .wrap(true),
+                );
+                ui.add_space(2.0);
+                continue;
+            }
+
+            let bullet = line
+                .strip_prefix("[*]")
+                .or_else(|| line.strip_prefix("[*] "))
+                .map(str::trim);
+            if let Some(item) = bullet {
+                self.render_description_inline(ui, ctx, item, true, clip_rect);
+                continue;
+            }
+
+            self.render_description_inline(ui, ctx, line, in_list, clip_rect);
+        }
+    }
+
+    fn render_description_inline(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        line: &str,
+        bullet: bool,
+        clip_rect: egui::Rect,
+    ) {
+        let segments = parse_bbcode_inline(line);
+        if !segments
+            .iter()
+            .any(|segment| matches!(segment, BbcodeSegment::Image { .. }))
+        {
+            self.render_description_text_segments(ui, segments, bullet);
+            return;
+        }
+
+        let mut text_segments = Vec::new();
+        let mut bullet_pending = bullet;
+        for segment in segments {
+            match segment {
+                BbcodeSegment::Image { url, target_url } => {
+                    if !text_segments.is_empty() || bullet_pending {
+                        self.render_description_text_segments(
+                            ui,
+                            std::mem::take(&mut text_segments),
+                            bullet_pending,
+                        );
+                        bullet_pending = false;
+                    }
+                    self.render_description_image(
+                        ui,
+                        ctx,
+                        url.trim(),
+                        target_url.as_deref(),
+                        clip_rect,
+                    );
+                }
+                segment => text_segments.push(segment),
+            }
+        }
+        if !text_segments.is_empty() || bullet_pending {
+            self.render_description_text_segments(ui, text_segments, bullet_pending);
+        }
+    }
+
+    fn render_description_text_segments(
+        &mut self,
+        ui: &mut egui::Ui,
+        segments: Vec<BbcodeSegment>,
+        bullet: bool,
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            if bullet {
+                ui.add(
+                    egui::Label::new(egui::RichText::new("- ").size(DESCRIPTION_FONT_SIZE))
+                        .wrap(false),
+                );
+            }
+
+            for segment in segments {
+                match segment {
+                    BbcodeSegment::Text(text) => {
+                        let text = normalize_inline_spacing(&text);
+                        if !text.is_empty() {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(text).size(DESCRIPTION_FONT_SIZE),
+                                )
+                                .wrap(true),
+                            );
+                        }
+                    }
+                    BbcodeSegment::Link { label, url } => {
+                        let label = if label.trim().is_empty() {
+                            url.trim()
+                        } else {
+                            label.trim()
+                        };
+                        let response = ui
+                            .link(egui::RichText::new(label).size(DESCRIPTION_FONT_SIZE))
+                            .on_hover_text(url.as_str());
+                        if response.clicked() {
+                            match open_steam_or_web(&url) {
+                                Ok(()) => {
+                                    self.status_message = self.t("opened_steam").to_string();
+                                }
+                                Err(error) => {
+                                    self.status_message =
+                                        format!("{}: {}", self.t("open_workshop_failed"), error);
+                                }
+                            }
+                        }
+                    }
+                    BbcodeSegment::Image { .. } => {}
+                }
+            }
+        });
+    }
+
+    fn render_description_image(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        url: &str,
+        target_url: Option<&str>,
+        clip_rect: egui::Rect,
+    ) {
+        if url.is_empty() {
+            return;
+        }
+
+        if let Some(texture) = self.description_image_texture(ctx, url).cloned() {
+            let original = texture.size_vec2();
+            if original.x <= 0.0 || original.y <= 0.0 {
+                return;
+            }
+            let max_width = ui.available_width().min(760.0);
+            let max_height = 360.0;
+            let scale = (max_width / original.x)
+                .min(max_height / original.y)
+                .min(1.0);
+            let size = egui::vec2(original.x * scale, original.y * scale);
+            let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+            let image_rect = egui::Align2::LEFT_TOP.align_size_within_rect(size, rect);
+            ui.painter()
+                .with_clip_rect(clip_rect.intersect(rect))
+                .image(
+                    texture.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            let open_url = target_url
+                .filter(|target_url| !target_url.trim().is_empty())
+                .unwrap_or(url);
+            let response = response.on_hover_text(open_url);
+            if response.clicked() {
+                if let Err(error) = open_steam_or_web(open_url) {
+                    self.status_message = format!("{}: {}", self.t("open_workshop_failed"), error);
+                }
+            }
+            ui.add_space(6.0);
+        } else if let Some(error) = self.description_image_failures.get(url) {
+            ui.colored_label(
+                egui::Color32::from_rgb(180, 110, 80),
+                format!("Image unavailable: {}", error),
+            );
+        } else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(egui::RichText::new("Loading image...").size(DESCRIPTION_FONT_SIZE));
+            });
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
+    fn description_image_texture(
+        &mut self,
+        ctx: &egui::Context,
+        url: &str,
+    ) -> Option<&egui::TextureHandle> {
+        if self.description_image_textures.contains_key(url) {
+            return self.description_image_textures.get(url);
+        }
+        if self.description_image_failures.contains_key(url) {
+            return None;
+        }
+
+        if let Ok(mut results) = self.description_image_results.lock() {
+            if let Some(result) = results.remove(url) {
+                self.description_image_loading.remove(url);
+                match result {
+                    Ok(bytes) => match image::load_from_memory(&bytes) {
+                        Ok(image) => {
+                            let image = image.to_rgba8();
+                            let size = [image.width() as usize, image.height() as usize];
+                            let pixels = image.as_raw();
+                            let color_image =
+                                egui::ColorImage::from_rgba_unmultiplied(size, pixels);
+                            let texture = ctx.load_texture(
+                                format!(
+                                    "description_image_{}",
+                                    self.description_image_textures.len()
+                                ),
+                                color_image,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.description_image_textures
+                                .insert(url.to_string(), texture);
+                        }
+                        Err(error) => {
+                            self.description_image_failures
+                                .insert(url.to_string(), error.to_string());
+                        }
+                    },
+                    Err(error) => {
+                        self.description_image_failures
+                            .insert(url.to_string(), error);
+                    }
+                }
+            }
+        }
+
+        if !self.description_image_textures.contains_key(url)
+            && !self.description_image_failures.contains_key(url)
+            && self.description_image_loading.insert(url.to_string())
+        {
+            let url = url.to_string();
+            let results = self.description_image_results.clone();
+            thread::spawn(move || {
+                let result = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(20))
+                    .build()
+                    .map_err(|error| error.to_string())
+                    .and_then(|client| {
+                        client
+                            .get(&url)
+                            .send()
+                            .and_then(|response| response.error_for_status())
+                            .and_then(|response| response.bytes())
+                            .map(|bytes| bytes.to_vec())
+                            .map_err(|error| error.to_string())
+                    });
+                if let Ok(mut results) = results.lock() {
+                    results.insert(url, result);
+                }
+            });
+        }
+
+        self.description_image_textures.get(url)
     }
 
     fn render_workshop_creators(
@@ -1700,6 +2416,111 @@ impl PatcherApp {
         }
     }
 
+    fn sync_app_update_notice(&mut self) {
+        if matches!(self.app_update_state(), AppUpdateState::Available(_))
+            && !self.app_update_notice_seen
+        {
+            self.app_update_notice_seen = true;
+        }
+    }
+
+    fn render_app_update_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_app_update_dialog {
+            return;
+        }
+
+        let language = self.language();
+        let state = self.app_update_state();
+        let mut close = false;
+        let mut install = None;
+        let mut retry = false;
+
+        egui::Window::new(tr(language, "app_update_title"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| match state {
+                AppUpdateState::Available(update) => {
+                    ui.label(format!(
+                        "{} {} -> {}",
+                        tr(language, "app_update_body"),
+                        update.current_version,
+                        update.latest_version
+                    ));
+                    ui.add_space(4.0);
+                    ui.label(format!("Tag: {}", update.tag_name));
+                    ui.label(format!("Asset: {}", update.asset_name));
+                    if let Some(size) = update.asset_size {
+                        ui.label(format!(
+                            "{}: {}",
+                            tr(language, "size"),
+                            format_bytes(Some(size))
+                        ));
+                    }
+                    ui.hyperlink_to(tr(language, "open_web_page"), update.release_url.clone());
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(tr(language, "later")).clicked() {
+                            close = true;
+                        }
+                        if ui.button(tr(language, "install_app_update")).clicked() {
+                            install = Some(update);
+                        }
+                    });
+                }
+                AppUpdateState::Checking => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(tr(language, "checking_app_update"));
+                    });
+                }
+                AppUpdateState::Installing => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(tr(language, "installing_app_update"));
+                    });
+                }
+                AppUpdateState::UpToDate => {
+                    ui.label(tr(language, "app_up_to_date"));
+                    if ui.button(tr(language, "ok")).clicked() {
+                        close = true;
+                    }
+                }
+                AppUpdateState::Error(error) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(210, 80, 80),
+                        format!("{}: {}", tr(language, "app_update_failed"), error),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(tr(language, "close")).clicked() {
+                            close = true;
+                        }
+                        if ui.button(tr(language, "retry_app_update")).clicked() {
+                            retry = true;
+                        }
+                    });
+                }
+                AppUpdateState::Idle => {
+                    ui.label(tr(language, "ready"));
+                    if ui.button(tr(language, "check_app_update")).clicked() {
+                        retry = true;
+                    }
+                }
+            });
+
+        if close {
+            self.show_app_update_dialog = false;
+        }
+        if let Some(update) = install {
+            self.start_app_update_install(update);
+        }
+        if retry {
+            self.start_app_update_check(true);
+            self.show_app_update_dialog = true;
+        }
+    }
+
     fn render_dependency_check_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_dependency_check {
             return;
@@ -1907,31 +2728,25 @@ impl PatcherApp {
             }
         }
     }
-
-    fn ensure_buttons_visible_viewport(&self, ctx: &egui::Context) {
-        let current_size = ctx.input(|input| input.screen_rect().size());
-        let target_size = egui::vec2(
-            current_size.x.max(MIN_VISIBLE_WIDTH),
-            current_size.y.max(MIN_VISIBLE_HEIGHT),
-        );
-
-        if target_size != current_size {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target_size));
-        }
-    }
 }
 
 impl eframe::App for PatcherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.ensure_buttons_visible_viewport(ctx);
-
+        ctx.set_visuals(egui::Visuals::dark());
         if matches!(self.state, AppState::Syncing) {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         if self.show_dependency_check && self.dependency_check_is_checking() {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
+        if matches!(
+            self.app_update_state(),
+            AppUpdateState::Checking | AppUpdateState::Installing
+        ) {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         self.sync_state_from_logs();
+        self.sync_app_update_notice();
         self.ensure_selected_details_requested();
         if self.selected_workshop_id().is_some_and(|workshop_id| {
             self.details_cache
@@ -1984,6 +2799,7 @@ impl eframe::App for PatcherApp {
         self.render_confirmation_dialog(ctx);
         self.render_subscribe_notice_dialog(ctx);
         self.render_force_update_notice_dialog(ctx);
+        self.render_app_update_dialog(ctx);
         self.render_dependency_check_dialog(ctx);
     }
 }
@@ -1992,7 +2808,7 @@ pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
-            .with_inner_size([1180.0, 860.0])
+            .with_inner_size([1020.0, 760.0])
             .with_min_inner_size([MIN_VISIBLE_WIDTH, MIN_VISIBLE_HEIGHT])
             .with_resizable(true),
         ..Default::default()
@@ -2008,9 +2824,6 @@ pub fn run() -> eframe::Result<()> {
             style.visuals.widgets.inactive.rounding = egui::Rounding::same(4.0);
             style.visuals.widgets.active.rounding = egui::Rounding::same(4.0);
             style.visuals.widgets.hovered.rounding = egui::Rounding::same(4.0);
-            for (_, font_id) in style.text_styles.iter_mut() {
-                font_id.size *= 1.1;
-            }
             cc.egui_ctx.set_style(style);
 
             Box::new(PatcherApp::default())
@@ -2168,30 +2981,492 @@ fn dependency_row(ui: &mut egui::Ui, label: &str, ok: bool, value: String, langu
     ui.end_row();
 }
 
-fn render_description_text_box(
-    ui: &mut egui::Ui,
-    id_source: impl std::hash::Hash,
-    text: &str,
-    height: f32,
-) {
-    let inner_margin = 8.0;
-    let inner_height =
-        (height - inner_margin * 2.0).max(DESCRIPTION_MIN_HEIGHT - inner_margin * 2.0);
+fn opaque_section_frame(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::none()
+        .fill(ui.visuals().panel_fill)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+}
 
+fn mod_row_text(
+    ui: &egui::Ui,
+    state_label: &str,
+    state_prefix: &str,
+    state_color: egui::Color32,
+    label: &str,
+    label_color: egui::Color32,
+    auto_label: Option<&str>,
+) -> egui::WidgetText {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = ui.available_width().max(80.0);
+    egui::RichText::new(format!("{} ", state_label))
+        .color(egui::Color32::from_rgb(145, 145, 145))
+        .append_to(
+            &mut job,
+            ui.style(),
+            egui::FontSelection::Default,
+            egui::Align::Center,
+        );
+    egui::RichText::new(state_prefix)
+        .color(state_color)
+        .append_to(
+            &mut job,
+            ui.style(),
+            egui::FontSelection::Default,
+            egui::Align::Center,
+        );
+    egui::RichText::new(format!("  {}", label))
+        .color(label_color)
+        .append_to(
+            &mut job,
+            ui.style(),
+            egui::FontSelection::Default,
+            egui::Align::Center,
+        );
+    if let Some(auto_label) = auto_label {
+        egui::RichText::new(" | ")
+            .color(egui::Color32::from_rgb(120, 120, 120))
+            .append_to(
+                &mut job,
+                ui.style(),
+                egui::FontSelection::Default,
+                egui::Align::Center,
+            );
+        egui::RichText::new(auto_label)
+            .color(egui::Color32::from_rgb(220, 120, 70))
+            .append_to(
+                &mut job,
+                ui.style(),
+                egui::FontSelection::Default,
+                egui::Align::Center,
+            );
+    }
+    job.into()
+}
+
+fn render_summary_row(ui: &mut egui::Ui, label: &str, add_value: impl FnOnce(&mut egui::Ui)) {
+    const LABEL_WIDTH: f32 = 72.0;
+
+    ui.horizontal_top(|ui| {
+        ui.add_sized([LABEL_WIDTH, 18.0], egui::Label::new(label));
+        let value_width = ui.available_width().max(0.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(value_width, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_max_width(value_width);
+                add_value(ui);
+            },
+        );
+    });
+}
+
+fn selected_thumbnail_slot_size(
+    available_width: f32,
+    gap: f32,
+    details_state: Option<&WorkshopDetailsState>,
+) -> Option<egui::Vec2> {
+    if !matches!(details_state, Some(WorkshopDetailsState::Ready(_))) {
+        return None;
+    }
+
+    let min_summary_width = if available_width >= 760.0 {
+        560.0
+    } else {
+        460.0
+    };
+    let max_thumbnail_width = available_width - min_summary_width - gap;
+    if max_thumbnail_width < 96.0 {
+        return None;
+    }
+
+    let width = max_thumbnail_width.min(144.0).max(96.0);
+    let height = width.min(128.0);
+    Some(egui::vec2(width, height))
+}
+
+fn render_workshop_meta_line(ui: &mut egui::Ui, details: &WorkshopDetails, language: UiLanguage) {
+    let meta = [
+        format!(
+            "{} {}",
+            tr(language, "steam_updated"),
+            format_timestamp(details.time_updated)
+        ),
+        format!(
+            "{} {}",
+            tr(language, "created"),
+            format_timestamp(details.time_created)
+        ),
+        format!(
+            "{} {}",
+            tr(language, "size"),
+            format_bytes(details.file_size)
+        ),
+        format!("{} {}", tr(language, "views"), format_count(details.views)),
+        format!(
+            "{} {}",
+            tr(language, "subscriptions"),
+            format_count(details.subscriptions)
+        ),
+        format!(
+            "{} {}",
+            tr(language, "favorites"),
+            format_count(details.favorited)
+        ),
+    ]
+    .join("  |  ");
+
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(meta)
+                .small()
+                .color(egui::Color32::from_rgb(140, 140, 140)),
+        )
+        .wrap(true),
+    );
+}
+
+fn render_description_text_box(ui: &mut egui::Ui, text: &str) {
+    let inner_margin = 10.0;
+    let content_width = (ui.available_width() - inner_margin * 2.0).max(120.0);
     egui::Frame::group(ui.style())
         .fill(ui.visuals().extreme_bg_color)
         .inner_margin(egui::Margin::same(inner_margin))
         .show(ui, |ui| {
-            ui.set_min_height(inner_height);
-            egui::ScrollArea::vertical()
-                .id_source(id_source)
-                .max_height(inner_height)
-                .min_scrolled_height(inner_height)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.add(egui::Label::new(text).wrap(true));
-                });
+            ui.set_min_width(content_width);
+            ui.add(
+                egui::Label::new(egui::RichText::new(text).size(DESCRIPTION_FONT_SIZE)).wrap(true),
+            );
         });
+}
+
+enum BbcodeSegment {
+    Text(String),
+    Link {
+        label: String,
+        url: String,
+    },
+    Image {
+        url: String,
+        target_url: Option<String>,
+    },
+}
+
+#[allow(dead_code)]
+fn steam_description_to_display_text(text: &str) -> String {
+    let mut output = String::new();
+    let mut in_list = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            push_single_blank_line(&mut output);
+            continue;
+        }
+
+        let lower = line.to_ascii_lowercase();
+        if lower == "[list]" || lower == "[olist]" {
+            in_list = true;
+            continue;
+        }
+        if lower == "[/list]" || lower == "[/olist]" {
+            in_list = false;
+            continue;
+        }
+
+        if let Some(heading) = wrapped_bbcode_content(line, "h1")
+            .or_else(|| wrapped_bbcode_content(line, "h2"))
+            .or_else(|| wrapped_bbcode_content(line, "h3"))
+        {
+            push_nonempty_line(&mut output, strip_bbcode_tags(heading).trim());
+            continue;
+        }
+
+        let bullet = line
+            .strip_prefix("[*]")
+            .or_else(|| line.strip_prefix("[*] "))
+            .map(str::trim);
+        if let Some(item) = bullet {
+            push_nonempty_line(
+                &mut output,
+                &format!("• {}", bbcode_inline_to_text(item).trim()),
+            );
+            continue;
+        }
+        if in_list {
+            push_nonempty_line(
+                &mut output,
+                &format!("• {}", bbcode_inline_to_text(line).trim()),
+            );
+            continue;
+        }
+
+        push_nonempty_line(&mut output, bbcode_inline_to_text(line).trim());
+    }
+
+    output.trim().to_string()
+}
+
+fn bbcode_inline_to_text(line: &str) -> String {
+    let segments = parse_bbcode_inline(line);
+    let mut output = String::new();
+    for segment in segments {
+        match segment {
+            BbcodeSegment::Text(text) => output.push_str(&text),
+            BbcodeSegment::Link { label, url } => {
+                if label.trim().is_empty() {
+                    output.push_str(&url);
+                } else if label.trim() == url.trim() {
+                    output.push_str(label.trim());
+                } else {
+                    output.push_str(label.trim());
+                    output.push_str(" (");
+                    output.push_str(url.trim());
+                    output.push(')');
+                }
+            }
+            BbcodeSegment::Image { url, target_url } => {
+                if let Some(target_url) = target_url.filter(|target_url| !target_url.is_empty()) {
+                    output.push_str(&target_url);
+                } else {
+                    output.push_str(&url);
+                }
+            }
+        }
+    }
+    normalize_inline_spacing(&output)
+}
+
+#[allow(dead_code)]
+fn push_nonempty_line(output: &mut String, line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    output.push_str(line);
+    output.push('\n');
+}
+
+#[allow(dead_code)]
+fn push_single_blank_line(output: &mut String) {
+    if !output.ends_with("\n\n") {
+        output.push('\n');
+    }
+}
+
+fn normalize_inline_spacing(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn parse_bbcode_inline(input: &str) -> Vec<BbcodeSegment> {
+    let mut segments = Vec::new();
+    let mut buffer = String::new();
+    let mut index = 0;
+
+    while index < input.len() {
+        let rest = &input[index..];
+        if rest.starts_with('[') {
+            if let Some(close_offset) = rest.find(']') {
+                let tag = &rest[1..close_offset];
+                let tag_lower = tag.trim().to_ascii_lowercase();
+                let tag_end = index + close_offset + 1;
+
+                match tag_lower.as_str() {
+                    "b" | "/b" | "i" | "/i" | "u" | "/u" | "strike" | "/strike" => {
+                        flush_bbcode_text(&mut segments, &mut buffer);
+                        index = tag_end;
+                        continue;
+                    }
+                    "br" | "hr" => {
+                        buffer.push(' ');
+                        index = tag_end;
+                        continue;
+                    }
+                    "url" => {
+                        if let Some((inner, after)) = bbcode_inner_after(input, tag_end, "url") {
+                            flush_bbcode_text(&mut segments, &mut buffer);
+                            let url = strip_bbcode_tags(inner);
+                            if !url.trim().is_empty() {
+                                if let Some(image_url) = bbcode_image_only_url(inner) {
+                                    segments.push(BbcodeSegment::Image {
+                                        url: image_url,
+                                        target_url: Some(url.trim().to_string()),
+                                    });
+                                } else {
+                                    segments.push(BbcodeSegment::Link {
+                                        label: url.trim().to_string(),
+                                        url: url.trim().to_string(),
+                                    });
+                                }
+                            }
+                            index = after;
+                            continue;
+                        }
+                    }
+                    "img" => {
+                        if let Some((inner, after)) = bbcode_inner_after(input, tag_end, "img") {
+                            flush_bbcode_text(&mut segments, &mut buffer);
+                            let url = strip_bbcode_tags(inner);
+                            if !url.trim().is_empty() {
+                                segments.push(BbcodeSegment::Image {
+                                    url: url.trim().to_string(),
+                                    target_url: None,
+                                });
+                            }
+                            index = after;
+                            continue;
+                        }
+                    }
+                    _ if tag_lower.starts_with("url=") => {
+                        if let Some((inner, after)) = bbcode_inner_after(input, tag_end, "url") {
+                            flush_bbcode_text(&mut segments, &mut buffer);
+                            let url = tag[4..].trim().trim_matches('"').trim_matches('\'');
+                            let label = strip_bbcode_tags(inner);
+                            if !url.is_empty() {
+                                if let Some(image_url) = bbcode_image_only_url(inner) {
+                                    segments.push(BbcodeSegment::Image {
+                                        url: image_url,
+                                        target_url: Some(url.to_string()),
+                                    });
+                                } else {
+                                    segments.push(BbcodeSegment::Link {
+                                        label: if label.trim().is_empty() {
+                                            url.to_string()
+                                        } else {
+                                            label.trim().to_string()
+                                        },
+                                        url: url.to_string(),
+                                    });
+                                }
+                            }
+                            index = after;
+                            continue;
+                        }
+                    }
+                    _ => {
+                        index = tag_end;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        buffer.push(ch);
+        index += ch.len_utf8();
+    }
+
+    flush_bbcode_text(&mut segments, &mut buffer);
+    segments
+}
+
+fn flush_bbcode_text(segments: &mut Vec<BbcodeSegment>, buffer: &mut String) {
+    if buffer.is_empty() {
+        return;
+    }
+    let text = std::mem::take(buffer);
+    segments.push(BbcodeSegment::Text(text));
+}
+
+fn bbcode_inner_after<'a>(
+    input: &'a str,
+    content_start: usize,
+    tag: &str,
+) -> Option<(&'a str, usize)> {
+    let closing = format!("[/{}]", tag);
+    let relative_end = find_case_insensitive(&input[content_start..], &closing)?;
+    let content_end = content_start + relative_end;
+    Some((
+        &input[content_start..content_end],
+        content_end + closing.len(),
+    ))
+}
+
+fn bbcode_image_only_url(input: &str) -> Option<String> {
+    let image_url = first_bbcode_image_url(input)?;
+    let visible_text = strip_bbcode_tags(input);
+    let visible_text = visible_text.trim();
+    if visible_text.is_empty() || visible_text == image_url {
+        Some(image_url)
+    } else {
+        None
+    }
+}
+
+fn first_bbcode_image_url(input: &str) -> Option<String> {
+    let open = find_case_insensitive(input, "[img]")?;
+    let content_start = open + "[img]".len();
+    let close = find_case_insensitive(&input[content_start..], "[/img]")?;
+    let content_end = content_start + close;
+    let image_url = strip_bbcode_tags(&input[content_start..content_end]);
+    let image_url = image_url.trim();
+    (!image_url.is_empty()).then(|| image_url.to_string())
+}
+
+fn wrapped_bbcode_content<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
+    let start = format!("[{}]", tag);
+    let end = format!("[/{}]", tag);
+    let lower = line.to_ascii_lowercase();
+    if lower.starts_with(&start) && lower.ends_with(&end) {
+        Some(&line[start.len()..line.len() - end.len()])
+    } else {
+        None
+    }
+}
+
+fn strip_bbcode_tags(input: &str) -> String {
+    let mut output = String::new();
+    let mut index = 0;
+    while index < input.len() {
+        let rest = &input[index..];
+        if rest.starts_with('[') {
+            if let Some(close_offset) = rest.find(']') {
+                index += close_offset + 1;
+                continue;
+            }
+        }
+
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+    output
+}
+
+fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .to_ascii_lowercase()
+        .find(&needle.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_bbcode_inline, BbcodeSegment};
+
+    #[test]
+    fn parses_plain_bbcode_image_as_image_segment() {
+        let segments = parse_bbcode_inline("[img]https://example.test/image.png[/img]");
+        assert!(matches!(
+            segments.as_slice(),
+            [BbcodeSegment::Image { url, target_url }]
+                if url == "https://example.test/image.png" && target_url.is_none()
+        ));
+    }
+
+    #[test]
+    fn parses_linked_bbcode_image_as_image_segment_with_target() {
+        let segments = parse_bbcode_inline(
+            "[url=https://example.test/page][img]https://example.test/image.png[/img][/url]",
+        );
+        assert!(matches!(
+            segments.as_slice(),
+            [BbcodeSegment::Image { url, target_url }]
+                if url == "https://example.test/image.png"
+                    && target_url.as_deref() == Some("https://example.test/page")
+        ));
+    }
 }
 
 fn reset_update_progress(progress: &Arc<Mutex<UpdateProgress>>, total: usize) {
@@ -2288,10 +3563,48 @@ fn mod_matches_query(installed_mod: &InstalledMod, query: &str) -> bool {
             .unwrap_or_default()
             .to_ascii_lowercase()
             .contains(query)
+        || if installed_mod.enabled {
+            "enabled".contains(query) || "활성".contains(query)
+        } else {
+            "disabled".contains(query) || "비활성".contains(query)
+        }
         || installed_mod
             .workshop_id
             .map(|workshop_id| workshop_id.to_string().contains(query))
             .unwrap_or(false)
+}
+
+fn render_selected_title(
+    ui: &mut egui::Ui,
+    installed_mod: &InstalledMod,
+    details_state: Option<&WorkshopDetailsState>,
+) {
+    let local_name = installed_mod.display_name();
+    let Some(WorkshopDetailsState::Ready(details)) = details_state else {
+        ui.add(egui::Label::new(egui::RichText::new(local_name).strong().size(18.0)).wrap(true));
+        return;
+    };
+
+    if local_name.eq_ignore_ascii_case(&details.title) {
+        ui.add(egui::Label::new(egui::RichText::new(local_name).strong().size(18.0)).wrap(true));
+    } else {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!("{} ({})", local_name, details.title))
+                    .strong()
+                    .size(18.0),
+            )
+            .wrap(true),
+        );
+    }
+}
+
+fn current_version_color(status: &ModUpdateStatus) -> egui::Color32 {
+    match status {
+        ModUpdateStatus::Outdated => egui::Color32::from_rgb(230, 140, 45),
+        ModUpdateStatus::LocalNewer => egui::Color32::from_rgb(120, 130, 235),
+        _ => status.color(),
+    }
 }
 
 fn system_language() -> UiLanguage {
@@ -2431,9 +3744,22 @@ fn tr(language: UiLanguage, key: &'static str) -> &'static str {
             "error" => "오류",
             "available" => "사용 가능",
             "missing" => "없음",
+            "check_app_update" => "앱 업데이트 확인",
+            "checking_app_update" => "앱 업데이트 확인 중...",
+            "app_up_to_date" => "앱 최신 버전",
+            "app_update_available" => "새 앱 버전:",
+            "install_app_update" => "설치 후 재시작",
+            "installing_app_update" => "업데이트를 설치하는 중...",
+            "app_update_failed" => "앱 업데이트 실패",
+            "retry_app_update" => "다시 확인",
+            "app_update_title" => "앱 업데이트",
+            "app_update_body" => "새 버전을 설치할 수 있습니다.",
+            "later" => "나중에",
             "auto_update" => "자동 업데이트",
             "exclude_auto_update" => "자동 업데이트 제외",
             "auto_excluded_short" => "자동 제외",
+            "auto_update_off_short" => "자동 OFF",
+            "mod_state_short" => "모드",
             "show_log" => "로그 표시",
             "language" => "언어",
             "path" => "경로",
@@ -2448,7 +3774,27 @@ fn tr(language: UiLanguage, key: &'static str) -> &'static str {
             "search_hint" => "이름, 폴더, 버전, Workshop ID",
             "no_mods" => "모드 폴더가 없습니다.",
             "no_match" => "검색과 일치하는 모드가 없습니다.",
+            "enabled_mods" => "활성화된 모드",
+            "disabled_mods" => "비활성화된 모드",
+            "no_enabled_mods" => "활성화된 모드가 없습니다.",
+            "no_disabled_mods" => "비활성화된 모드가 없습니다.",
+            "enabled_short" => "ON",
+            "disabled_short" => "OFF",
+            "update_checkbox_hint" => "체크 = 업데이트 대상 선택",
+            "double_click_toggle_mod" => "더블클릭으로 활성/비활성을 전환합니다.",
             "folder" => "폴더",
+            "mod_state" => "모드 상태",
+            "enabled" => "활성화됨",
+            "disabled" => "비활성화됨",
+            "enable_mod" => "활성화",
+            "disable_mod" => "비활성화",
+            "mod_enabled" => "모드 활성화됨",
+            "mod_disabled" => "모드 비활성화됨",
+            "toggle_mod_failed" => "모드 상태 변경 실패",
+            "version" => "버전",
+            "current_version" => "현재",
+            "steam_version_short" => "Steam",
+            "latest_version" => "최신",
             "local_version" => "로컬 버전",
             "steam_version" => "Steam 버전",
             "version_status" => "버전 상태",
@@ -2481,7 +3827,7 @@ fn tr(language: UiLanguage, key: &'static str) -> &'static str {
             "update_all" => "모두 업데이트",
             "force_update" => "강제 업데이트",
             "force_update_title" => "강제 업데이트",
-            "force_update_body" => "파일을 전부 다시 확인합니다. 최신으로 표시된 모드도 Workshop 파일과 비교한 뒤 필요한 파일을 다시 적용합니다.",
+            "force_update_body" => "파일을 전부 다시 확인합니다. 최신으로 표시된 모드도 Workshop 파일과 비교한 뒤 필요한 파일을 다시 적용합니다. 모드 비활성화 상태를 나타내는 disable.it 파일은 유지됩니다.",
             "downloading_applying" => "Workshop 파일을 다운로드하고 적용하는 중...",
             "log" => "로그:",
             "select_mod" => "모드를 선택하세요.",
@@ -2542,9 +3888,22 @@ fn tr(language: UiLanguage, key: &'static str) -> &'static str {
             "error" => "Error",
             "available" => "Available",
             "missing" => "Missing",
+            "check_app_update" => "Check app update",
+            "checking_app_update" => "Checking app update...",
+            "app_up_to_date" => "App is up to date",
+            "app_update_available" => "New app version:",
+            "install_app_update" => "Install & Restart",
+            "installing_app_update" => "Installing update...",
+            "app_update_failed" => "App update failed",
+            "retry_app_update" => "Retry",
+            "app_update_title" => "App Update",
+            "app_update_body" => "A new version is available.",
+            "later" => "Later",
             "auto_update" => "Auto update",
             "exclude_auto_update" => "Exclude from auto update",
             "auto_excluded_short" => "Auto excluded",
+            "auto_update_off_short" => "Auto OFF",
+            "mod_state_short" => "Mod",
             "show_log" => "Show log",
             "language" => "Language",
             "path" => "Path",
@@ -2559,7 +3918,27 @@ fn tr(language: UiLanguage, key: &'static str) -> &'static str {
             "search_hint" => "name, folder, version, Workshop ID",
             "no_mods" => "No mod folders found.",
             "no_match" => "No mods match the current search.",
+            "enabled_mods" => "Enabled Mods",
+            "disabled_mods" => "Disabled Mods",
+            "no_enabled_mods" => "No enabled mods.",
+            "no_disabled_mods" => "No disabled mods.",
+            "enabled_short" => "ON",
+            "disabled_short" => "OFF",
+            "update_checkbox_hint" => "Check = include in updates",
+            "double_click_toggle_mod" => "Double-click to toggle enabled/disabled.",
             "folder" => "Folder",
+            "mod_state" => "Mod State",
+            "enabled" => "Enabled",
+            "disabled" => "Disabled",
+            "enable_mod" => "Enable",
+            "disable_mod" => "Disable",
+            "mod_enabled" => "Mod enabled",
+            "mod_disabled" => "Mod disabled",
+            "toggle_mod_failed" => "Failed to change mod state",
+            "version" => "Version",
+            "current_version" => "Current",
+            "steam_version_short" => "Steam",
+            "latest_version" => "Latest",
             "local_version" => "Local Version",
             "steam_version" => "Steam Version",
             "version_status" => "Version Status",
@@ -2592,7 +3971,7 @@ fn tr(language: UiLanguage, key: &'static str) -> &'static str {
             "update_all" => "Update All",
             "force_update" => "Force update",
             "force_update_title" => "Force Update",
-            "force_update_body" => "All files will be checked again. Mods marked as latest will still be compared against Workshop files and reapplied where needed.",
+            "force_update_body" => "All files will be checked again. Mods marked as latest will still be compared against Workshop files and reapplied where needed. The disable.it file that stores a disabled mod state is preserved.",
             "downloading_applying" => "Downloading and applying workshop files...",
             "log" => "Log:",
             "select_mod" => "Select a mod.",
@@ -2804,6 +4183,7 @@ fn scan_installed_mods(
         );
 
         mods.push(InstalledMod {
+            enabled: is_mod_enabled(&path),
             path,
             folder_name,
             name: metadata.name,
@@ -2818,8 +4198,6 @@ fn scan_installed_mods(
         });
     }
 
-    enrich_missing_cache_mods_from_steam(&mut mods);
-
     mods.sort_by(|left, right| {
         update_status_priority(&left.update_status)
             .cmp(&update_status_priority(&right.update_status))
@@ -2829,6 +4207,27 @@ fn scan_installed_mods(
     mods
 }
 
+fn disable_marker_path(mod_path: &Path) -> PathBuf {
+    mod_path.join("disable.it")
+}
+
+fn is_mod_enabled(mod_path: &Path) -> bool {
+    !disable_marker_path(mod_path).exists()
+}
+
+fn set_mod_enabled(mod_path: &Path, enabled: bool) -> anyhow::Result<()> {
+    let marker = disable_marker_path(mod_path);
+    if enabled {
+        if marker.exists() {
+            fs::remove_file(&marker)?;
+        }
+    } else {
+        fs::write(&marker, [])?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 fn enrich_missing_cache_mods_from_steam(mods: &mut [InstalledMod]) {
     let ids = mods
         .iter()
@@ -2911,6 +4310,18 @@ fn update_status_priority(status: &ModUpdateStatus) -> u8 {
         ModUpdateStatus::Unknown => 4,
         ModUpdateStatus::Latest => 5,
         ModUpdateStatus::LocalOnly => 6,
+    }
+}
+
+fn auto_update_exclusion_priority(installed_mod: &InstalledMod, exclusions: &HashSet<u64>) -> u8 {
+    if installed_mod
+        .workshop_id
+        .and_then(valid_workshop_id)
+        .is_some_and(|workshop_id| exclusions.contains(&workshop_id))
+    {
+        0
+    } else {
+        1
     }
 }
 

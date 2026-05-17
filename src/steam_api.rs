@@ -427,23 +427,9 @@ fn clean_description(description: &str) -> String {
         .replace("&lt;", "<")
         .replace("&gt;", ">");
 
-    let mut cleaned = String::with_capacity(normalized.len());
-    let mut in_tag = false;
-    for ch in normalized.chars() {
-        match ch {
-            '[' => in_tag = true,
-            ']' if in_tag => {
-                in_tag = false;
-                cleaned.push('\n');
-            }
-            _ if !in_tag => cleaned.push(ch),
-            _ => {}
-        }
-    }
-
     let mut output = String::new();
     let mut blank_lines = 0;
-    for line in cleaned.lines() {
+    for line in normalized.lines() {
         let line = line.trim();
         if line.is_empty() {
             blank_lines += 1;

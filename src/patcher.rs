@@ -246,7 +246,9 @@ fn should_skip(relative_path: &Path) -> bool {
         .unwrap_or_default()
         .to_string_lossy();
 
-    file_name == ".DS_Store" || file_name == "Thumbs.db"
+    file_name == ".DS_Store"
+        || file_name == "Thumbs.db"
+        || file_name.eq_ignore_ascii_case("disable.it")
 }
 
 fn log(logger: Option<&dyn Fn(String)>, msg: String) {
@@ -345,4 +347,87 @@ fn numeric_version_parts(version: &str) -> Vec<u64> {
     }
 
     parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::steam_workshop::SteamWorkshopClient;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn sync_preserves_local_disable_marker() {
+        let root = temp_test_dir("preserve_disable_marker");
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            source.join("metadata.xml"),
+            "<metadata><version>1.0.0</version></metadata>",
+        )
+        .unwrap();
+        fs::write(source.join("main.lua"), "-- workshop").unwrap();
+        fs::write(
+            target.join("metadata.xml"),
+            "<metadata><version>1.0.0</version></metadata>",
+        )
+        .unwrap();
+        fs::write(target.join("disable.it"), "").unwrap();
+        fs::write(target.join("removed.lua"), "-- removed").unwrap();
+
+        let patcher =
+            Patcher::new(SteamWorkshopClient::new(250900, 1), target.clone()).force_update(true);
+        patcher
+            .sync_from_source_dir_with_logger_and_progress(&source, None, None)
+            .unwrap();
+
+        assert!(target.join("disable.it").exists());
+        assert!(target.join("main.lua").exists());
+        assert!(!target.join("removed.lua").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_does_not_copy_source_disable_marker() {
+        let root = temp_test_dir("skip_source_disable_marker");
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            source.join("metadata.xml"),
+            "<metadata><version>1.0.0</version></metadata>",
+        )
+        .unwrap();
+        fs::write(source.join("disable.it"), "").unwrap();
+        fs::write(
+            target.join("metadata.xml"),
+            "<metadata><version>0.9.0</version></metadata>",
+        )
+        .unwrap();
+
+        let patcher = Patcher::new(SteamWorkshopClient::new(250900, 1), target.clone());
+        patcher
+            .sync_from_source_dir_with_logger_and_progress(&source, None, None)
+            .unwrap();
+
+        assert!(!target.join("disable.it").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "isaac_mod_manager_{}_{}_{}",
+            label,
+            std::process::id(),
+            nonce
+        ))
+    }
 }
