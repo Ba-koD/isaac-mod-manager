@@ -2421,6 +2421,7 @@ impl PatcherApp {
             && !self.app_update_notice_seen
         {
             self.app_update_notice_seen = true;
+            self.show_app_update_dialog = true;
         }
     }
 

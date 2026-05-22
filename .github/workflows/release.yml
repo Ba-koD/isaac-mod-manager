@@ -2,9 +2,15 @@ name: Release
 
 on:
   push:
+    branches:
+      - "main"
     tags:
       - "v*"
       - "*.*.*"
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -23,17 +29,49 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        run: |
+          version=$(grep '^version = ' Cargo.toml | head -n 1 | sed -E 's/version = "([^"]+)"/\1/')
+          tag_name="v${version}"
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            test "${version}" = "${GITHUB_REF_NAME}" || test "v${version}" = "${GITHUB_REF_NAME}"
+            tag_name="${GITHUB_REF_NAME}"
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag_name=${tag_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create version tag
+        if: github.ref_type != 'tag'
+        shell: bash
+        run: |
+          tag_name="${{ steps.release.outputs.tag_name }}"
+          existing_ref=$(git ls-remote --tags origin "refs/tags/${tag_name}" | awk '{print $1}')
+          peeled_ref=$(git ls-remote --tags origin "refs/tags/${tag_name}^{}" | awk '{print $1}')
+          tag_target="${peeled_ref:-$existing_ref}"
+
+          if [[ -n "${tag_target}" && "${tag_target}" != "${GITHUB_SHA}" ]]; then
+            echo "Tag ${tag_name} already exists at ${tag_target}, not ${GITHUB_SHA}."
+            exit 1
+          fi
+
+          if [[ -z "${tag_target}" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "${tag_name}" -m "${tag_name}" "${GITHUB_SHA}"
+            git push origin "refs/tags/${tag_name}"
+          fi
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Verify tag matches Cargo version
-        shell: bash
-        run: |
-          version=$(grep '^version = ' Cargo.toml | head -n 1 | sed -E 's/version = "([^"]+)"/\1/')
-          test "${version}" = "${GITHUB_REF_NAME}" || test "v${version}" = "${GITHUB_REF_NAME}"
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -46,11 +84,19 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: ${{ matrix.asset_name }}
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+          tag_name: ${{ steps.release.outputs.tag_name }}
+          name: ${{ steps.release.outputs.tag_name }}
           body: |
             Tagged commit: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
 
             Download `${{ matrix.asset_name }}` from the assets below.
           prerelease: false
           overwrite_files: true
+
+      - name: Update latest tag
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f latest "${GITHUB_SHA}"
+          git push origin --force refs/tags/latest
