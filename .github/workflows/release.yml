@@ -92,11 +92,3 @@ jobs:
             Download `${{ matrix.asset_name }}` from the assets below.
           prerelease: false
           overwrite_files: true
-
-      - name: Update latest tag
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -f latest "${GITHUB_SHA}"
-          git push origin --force refs/tags/latest
