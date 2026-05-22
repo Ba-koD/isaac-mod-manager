@@ -176,17 +176,47 @@ fn schedule_replace_and_restart(downloaded_exe: &Path, current_exe: &Path) -> Re
     let staging_dir = downloaded_exe
         .parent()
         .context("Downloaded update path has no parent directory")?;
+    let current_dir = current_exe
+        .parent()
+        .context("Current executable path has no parent directory")?;
+    let log_file = staging_dir.join("update.log");
     let script = format!(
         "$ErrorActionPreference = 'Stop'; \
-         Wait-Process -Id {pid}; \
-         Copy-Item -LiteralPath {downloaded} -Destination {current} -Force; \
-         Start-Process -FilePath {current}; \
-         Remove-Item -LiteralPath {downloaded} -Force -ErrorAction SilentlyContinue; \
-         Remove-Item -LiteralPath {staging} -Recurse -Force -ErrorAction SilentlyContinue",
+         $log = {log}; \
+         function Write-UpdateLog([string]$message) {{ \
+             Add-Content -LiteralPath $log -Value ((Get-Date -Format o) + ' ' + $message) -Encoding UTF8 -ErrorAction SilentlyContinue; \
+         }} \
+         try {{ \
+             Write-UpdateLog 'Waiting for app process to exit.'; \
+             Wait-Process -Id {pid} -ErrorAction SilentlyContinue; \
+             Start-Sleep -Milliseconds 500; \
+             $copied = $false; \
+             for ($attempt = 1; $attempt -le 20; $attempt++) {{ \
+                 try {{ \
+                     Copy-Item -LiteralPath {downloaded} -Destination {current} -Force -ErrorAction Stop; \
+                     $copied = $true; \
+                     break; \
+                 }} catch {{ \
+                     Write-UpdateLog ('Copy attempt ' + $attempt + ' failed: ' + $_.Exception.Message); \
+                     Start-Sleep -Milliseconds 500; \
+                 }} \
+             }} \
+             if (-not $copied) {{ throw 'Failed to replace current executable.'; }} \
+             Write-UpdateLog 'Starting updated app.'; \
+             Start-Process -FilePath {current} -WorkingDirectory {current_dir}; \
+             Start-Sleep -Seconds 2; \
+             Remove-Item -LiteralPath {downloaded} -Force -ErrorAction SilentlyContinue; \
+             Remove-Item -LiteralPath {staging} -Recurse -Force -ErrorAction SilentlyContinue; \
+         }} catch {{ \
+             Write-UpdateLog ('Update failed: ' + $_.Exception.Message); \
+             exit 1; \
+         }}",
         pid = std::process::id(),
         downloaded = powershell_literal(downloaded_exe),
         current = powershell_literal(current_exe),
+        current_dir = powershell_literal(current_dir),
         staging = powershell_literal(staging_dir),
+        log = powershell_literal(&log_file),
     );
 
     Command::new("powershell.exe")
