@@ -1,3 +1,4 @@
+use crate::steam_api::{fetch_workshop_summaries, SteamLanguage};
 use anyhow::{Context, Result};
 use encoding_rs::EUC_KR;
 use reqwest::blocking::Client;
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zip::ZipArchive;
 
 pub const ISAAC_APP_ID: u32 = 250900;
@@ -17,6 +18,7 @@ pub const CONCH_BLESSING_WORKSHOP_ID: u64 = 3545334858;
 const STEAMCMD_ZIP_URL: &str = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip";
 const DEFAULT_STEAM_CLIENT_DOWNLOAD_WAIT: Duration = Duration::from_secs(20);
 const STEAM_CLIENT_DOWNLOAD_POLL: Duration = Duration::from_secs(2);
+const CACHE_FRESHNESS_TOLERANCE: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct SteamWorkshopClient {
@@ -26,6 +28,11 @@ pub struct SteamWorkshopClient {
     steam_client_download_wait: Duration,
     steamcmd_lock: Option<Arc<Mutex<()>>>,
     force_download: bool,
+}
+
+enum SteamCmdDownload {
+    Ready(PathBuf),
+    AnonymousFailed,
 }
 
 impl SteamWorkshopClient {
@@ -61,86 +68,51 @@ impl SteamWorkshopClient {
     }
 
     pub fn download_latest(&self, logger: Option<&dyn Fn(String)>) -> Result<PathBuf> {
-        if let Some(path) =
-            find_cached_workshop_item(self.app_id, self.workshop_id, &self.steam_library_roots)
-        {
+        let workshop_updated_at = workshop_updated_at(self.workshop_id, logger);
+        let cached_path =
+            find_cached_workshop_item(self.app_id, self.workshop_id, &self.steam_library_roots);
+        if let Some(path) = &cached_path {
             let action = if self.force_download {
-                "Force update enabled; using Steam client workshop cache and verifying all files"
+                "Force update enabled; validating Workshop content before using cached files"
             } else {
-                "Using Steam client workshop cache"
+                "Validating Workshop content before using cached files"
             };
-            log(logger, format!("{}: {}", action, path.to_string_lossy()));
-            return Ok(path);
+            log(logger, format!("{}: {}", action, path.display()));
+            log_cache_freshness(path, workshop_updated_at, logger);
         }
 
-        log(
-            logger,
-            "Trying SteamCMD anonymous workshop download...".to_string(),
-        );
-        let anonymous_failed = {
-            let _steamcmd_guard = self
-                .steamcmd_lock
-                .as_ref()
-                .map(|lock| {
-                    log(logger, "Waiting for SteamCMD slot...".to_string());
-                    lock.lock()
-                })
-                .transpose()
-                .map_err(|_| anyhow::anyhow!("SteamCMD lock was poisoned"))?;
-
-            let steamcmd = ensure_steamcmd(logger)?;
-            let steamcmd_dir = steamcmd
-                .parent()
-                .context("SteamCMD path has no parent directory")?;
-
-            let app_id = self.app_id.to_string();
-            let workshop_id = self.workshop_id.to_string();
-            let args = self.steamcmd_args(&app_id, &workshop_id)?;
-
-            let output = run_steamcmd_streaming(&steamcmd, steamcmd_dir, args, logger)?;
-            let combined_lower = output.to_ascii_lowercase();
-
-            if combined_lower.contains("error!") || combined_lower.contains("download item failed")
-            {
-                true
-            } else {
-                let content_dir = steamcmd_dir
-                    .join("steamapps")
-                    .join("workshop")
-                    .join("content")
-                    .join(app_id)
-                    .join(workshop_id);
-
-                if content_dir.exists() {
-                    log(
-                        logger,
-                        format!("Steam workshop content ready: {}", content_dir.display()),
-                    );
-                    return Ok(content_dir);
-                }
-
-                return Err(anyhow::anyhow!(
-                    "SteamCMD finished but workshop content was not found at {}",
-                    content_dir.display()
-                ));
+        match self.try_steamcmd_download(logger) {
+            Ok(SteamCmdDownload::Ready(path)) => return Ok(path),
+            Ok(SteamCmdDownload::AnonymousFailed) => {}
+            Err(error) => {
+                log(
+                    logger,
+                    format!("SteamCMD workshop download failed: {}", error),
+                );
             }
-        };
-
-        if !anonymous_failed {
-            unreachable!("SteamCMD success path returns before reaching client fallback");
         }
 
         if let Some(path) =
             find_cached_workshop_item(self.app_id, self.workshop_id, &self.steam_library_roots)
         {
+            if cache_is_fresh(&path, workshop_updated_at) {
+                log(
+                    logger,
+                    format!(
+                        "SteamCMD did not provide fresh content; using verified Steam client workshop cache: {}",
+                        path.display()
+                    ),
+                );
+                return Ok(path);
+            }
+
             log(
                 logger,
                 format!(
-                    "SteamCMD failed, but Steam client workshop cache is available: {}",
+                    "Steam client workshop cache is stale or unverified, not applying it yet: {}",
                     path.display()
                 ),
             );
-            return Ok(path);
         }
 
         log(
@@ -150,13 +122,14 @@ impl SteamWorkshopClient {
         open_workshop_page(self.workshop_id, logger)?;
         log(
             logger,
-            "Waiting for Steam client workshop cache. If the item is already subscribed, wait for Steam downloads to finish.".to_string(),
+            "Waiting for Steam client workshop cache to update. If the item is already subscribed, wait for Steam downloads to finish.".to_string(),
         );
         if let Some(path) = wait_for_steam_client_cache(
             self.app_id,
             self.workshop_id,
             &self.steam_library_roots,
             self.steam_client_download_wait,
+            workshop_updated_at,
             logger,
         ) {
             return Ok(path);
@@ -164,7 +137,62 @@ impl SteamWorkshopClient {
 
         log(logger, format!("SUBSCRIBE_REQUIRED:{}", self.workshop_id));
         Err(anyhow::anyhow!(
-            "Steam client workshop cache was not found yet. Make sure the logged-in Steam account can access this item, subscribe/download it in Steam, wait for downloads to finish, then retry."
+            "Steam client workshop cache is missing or stale. Make sure the logged-in Steam account can access this item, subscribe/download it in Steam, wait for Steam downloads to finish, then retry."
+        ))
+    }
+
+    fn try_steamcmd_download(&self, logger: Option<&dyn Fn(String)>) -> Result<SteamCmdDownload> {
+        let action = if self.force_download {
+            "Trying SteamCMD anonymous workshop validation..."
+        } else {
+            "Trying SteamCMD anonymous workshop download..."
+        };
+        log(logger, action.to_string());
+
+        let _steamcmd_guard = self
+            .steamcmd_lock
+            .as_ref()
+            .map(|lock| {
+                log(logger, "Waiting for SteamCMD slot...".to_string());
+                lock.lock()
+            })
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("SteamCMD lock was poisoned"))?;
+
+        let steamcmd = ensure_steamcmd(logger)?;
+        let steamcmd_dir = steamcmd
+            .parent()
+            .context("SteamCMD path has no parent directory")?;
+
+        let app_id = self.app_id.to_string();
+        let workshop_id = self.workshop_id.to_string();
+        let args = self.steamcmd_args(&app_id, &workshop_id)?;
+
+        let output = run_steamcmd_streaming(&steamcmd, steamcmd_dir, args, logger)?;
+        let combined_lower = output.to_ascii_lowercase();
+
+        if combined_lower.contains("error!") || combined_lower.contains("download item failed") {
+            return Ok(SteamCmdDownload::AnonymousFailed);
+        }
+
+        let content_dir = steamcmd_dir
+            .join("steamapps")
+            .join("workshop")
+            .join("content")
+            .join(app_id)
+            .join(workshop_id);
+
+        if content_dir.exists() {
+            log(
+                logger,
+                format!("Steam workshop content ready: {}", content_dir.display()),
+            );
+            return Ok(SteamCmdDownload::Ready(content_dir));
+        }
+
+        Err(anyhow::anyhow!(
+            "SteamCMD finished but workshop content was not found at {}",
+            content_dir.display()
         ))
     }
 
@@ -188,10 +216,12 @@ fn wait_for_steam_client_cache(
     workshop_id: u64,
     steam_library_roots: &[PathBuf],
     wait: Duration,
+    workshop_updated_at: Option<SystemTime>,
     logger: Option<&dyn Fn(String)>,
 ) -> Option<PathBuf> {
     if wait.is_zero() {
-        return find_cached_workshop_item(app_id, workshop_id, steam_library_roots);
+        return find_cached_workshop_item(app_id, workshop_id, steam_library_roots)
+            .filter(|path| cache_is_fresh(path, workshop_updated_at));
     }
 
     let started = Instant::now();
@@ -199,11 +229,13 @@ fn wait_for_steam_client_cache(
 
     loop {
         if let Some(path) = find_cached_workshop_item(app_id, workshop_id, steam_library_roots) {
-            log(
-                logger,
-                format!("Steam client workshop cache is ready: {}", path.display()),
-            );
-            return Some(path);
+            if cache_is_fresh(&path, workshop_updated_at) {
+                log(
+                    logger,
+                    format!("Steam client workshop cache is ready: {}", path.display()),
+                );
+                return Some(path);
+            }
         }
 
         let elapsed = started.elapsed();
@@ -224,6 +256,92 @@ fn wait_for_steam_client_cache(
 
         thread::sleep(STEAM_CLIENT_DOWNLOAD_POLL);
     }
+}
+
+fn workshop_updated_at(workshop_id: u64, logger: Option<&dyn Fn(String)>) -> Option<SystemTime> {
+    let summaries = match fetch_workshop_summaries(&[workshop_id], SteamLanguage::ENGLISH) {
+        Ok(summaries) => summaries,
+        Err(error) => {
+            log(
+                logger,
+                format!("Could not verify Steam Workshop update time: {}", error),
+            );
+            return None;
+        }
+    };
+
+    let updated_at = summaries.get(&workshop_id)?.time_updated?;
+    UNIX_EPOCH.checked_add(Duration::from_secs(updated_at))
+}
+
+fn cache_is_fresh(cache_path: &Path, workshop_updated_at: Option<SystemTime>) -> bool {
+    let Some(workshop_updated_at) = workshop_updated_at else {
+        return false;
+    };
+    let Some(cache_updated_at) = newest_file_modified(cache_path) else {
+        return false;
+    };
+
+    cache_updated_at
+        .checked_add(CACHE_FRESHNESS_TOLERANCE)
+        .is_some_and(|cache_time| cache_time >= workshop_updated_at)
+}
+
+fn log_cache_freshness(
+    cache_path: &Path,
+    workshop_updated_at: Option<SystemTime>,
+    logger: Option<&dyn Fn(String)>,
+) {
+    let Some(workshop_updated_at) = workshop_updated_at else {
+        log(
+            logger,
+            "Steam Workshop update time unavailable; cache freshness cannot be verified."
+                .to_string(),
+        );
+        return;
+    };
+    let Some(cache_updated_at) = newest_file_modified(cache_path) else {
+        log(
+            logger,
+            "Steam client workshop cache has no readable file timestamps.".to_string(),
+        );
+        return;
+    };
+
+    if cache_is_fresh(cache_path, Some(workshop_updated_at)) {
+        log(
+            logger,
+            format!(
+                "Steam client workshop cache appears current: cache {}, Steam {}",
+                format_system_time(cache_updated_at),
+                format_system_time(workshop_updated_at)
+            ),
+        );
+    } else {
+        log(
+            logger,
+            format!(
+                "Steam client workshop cache appears stale: cache {}, Steam {}",
+                format_system_time(cache_updated_at),
+                format_system_time(workshop_updated_at)
+            ),
+        );
+    }
+}
+
+fn newest_file_modified(root: &Path) -> Option<SystemTime> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+        .max()
+}
+
+fn format_system_time(time: SystemTime) -> String {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "before-unix-epoch".to_string())
 }
 
 fn workshop_public_url(workshop_id: u64) -> String {

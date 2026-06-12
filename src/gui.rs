@@ -1,16 +1,16 @@
 use crate::app_update::{self, ReleaseUpdate};
 use crate::fs_utils::{find_isaac_game_path, find_steam_library_roots};
 use crate::patcher::Patcher;
-use crate::steam_api::{fetch_workshop_details, fetch_workshop_summaries, WorkshopDetails};
+use crate::steam_api::{
+    fetch_workshop_details, fetch_workshop_summaries, SteamLanguage, WorkshopDetails,
+};
 use crate::steam_workshop::{
-    find_cached_workshop_item, find_steamcmd, prepare_steamcmd, SteamWorkshopClient,
-    CONCH_BLESSING_WORKSHOP_ID, ISAAC_APP_ID,
+    find_steamcmd, prepare_steamcmd, SteamWorkshopClient, CONCH_BLESSING_WORKSHOP_ID, ISAAC_APP_ID,
 };
 use chrono::{DateTime, Local};
 use eframe::egui;
 use encoding_rs::EUC_KR;
 use serde::Deserialize;
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 #[cfg(target_os = "windows")]
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SUPPORTED_MOD_DIRECTORY: &str = "conch_blessing";
 const APP_TITLE: &str = "Isaac Mod Manager";
@@ -91,7 +91,6 @@ enum ModUpdateStatus {
     Outdated,
     LocalNewer,
     OnlineAvailable,
-    MissingSteamCache,
     Unknown,
     LocalOnly,
 }
@@ -106,6 +105,8 @@ struct PendingConfirmation {
 struct PendingSubscribeNotice {
     workshop_id: u64,
 }
+
+type WorkshopDetailsCacheKey = (u64, &'static str);
 
 #[derive(Clone, Debug)]
 struct UpdateProgress {
@@ -139,6 +140,12 @@ struct UpdateTarget {
 struct UpdateGroup {
     workshop_id: u64,
     targets: Vec<UpdateTarget>,
+}
+
+#[derive(Clone)]
+struct ModDragPayload {
+    path: PathBuf,
+    enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -202,14 +209,12 @@ impl ModUpdateStatus {
             (UiLanguage::Korean, Self::Outdated) => "업데이트 필요",
             (UiLanguage::Korean, Self::LocalNewer) => "로컬 버전 높음",
             (UiLanguage::Korean, Self::OnlineAvailable) => "온라인 확인됨",
-            (UiLanguage::Korean, Self::MissingSteamCache) => "Steam 미다운로드",
             (UiLanguage::Korean, Self::Unknown) => "확인 불가",
             (UiLanguage::Korean, Self::LocalOnly) => "로컬 전용",
             (_, Self::Latest) => "Latest",
             (_, Self::Outdated) => "Outdated",
             (_, Self::LocalNewer) => "Local newer",
             (_, Self::OnlineAvailable) => "Online available",
-            (_, Self::MissingSteamCache) => "Steam not downloaded",
             (_, Self::Unknown) => "Unknown",
             (_, Self::LocalOnly) => "Local only",
         }
@@ -221,7 +226,6 @@ impl ModUpdateStatus {
             Self::Outdated => egui::Color32::from_rgb(230, 140, 45),
             Self::LocalNewer => egui::Color32::from_rgb(120, 130, 235),
             Self::OnlineAvailable => egui::Color32::from_rgb(90, 150, 220),
-            Self::MissingSteamCache => egui::Color32::from_rgb(170, 150, 80),
             Self::Unknown => egui::Color32::from_rgb(150, 150, 150),
             Self::LocalOnly => egui::Color32::from_rgb(130, 130, 130),
         }
@@ -230,11 +234,7 @@ impl ModUpdateStatus {
     fn is_update_candidate(&self) -> bool {
         matches!(
             self,
-            Self::Outdated
-                | Self::LocalNewer
-                | Self::OnlineAvailable
-                | Self::MissingSteamCache
-                | Self::Unknown
+            Self::Outdated | Self::LocalNewer | Self::OnlineAvailable | Self::Unknown
         )
     }
 }
@@ -291,7 +291,7 @@ pub struct PatcherApp {
     show_force_update_notice: bool,
     shown_subscribe_notices: HashSet<u64>,
     search_query: String,
-    details_cache: Arc<Mutex<HashMap<u64, WorkshopDetailsState>>>,
+    details_cache: Arc<Mutex<HashMap<WorkshopDetailsCacheKey, WorkshopDetailsState>>>,
     preview_textures: HashMap<u64, egui::TextureHandle>,
     preview_failures: HashSet<u64>,
     description_image_textures: HashMap<String, egui::TextureHandle>,
@@ -391,8 +391,7 @@ impl PatcherApp {
             return;
         }
 
-        let steam_roots = self.steam_library_roots();
-        self.available_mods = scan_installed_mods(&mods_path, self.app_id, &steam_roots);
+        self.available_mods = scan_installed_mods(&mods_path, self.steam_language());
         self.sort_available_mods();
         self.sync_checked_update_selection();
         let restored_selection = previous_selected_path
@@ -470,6 +469,10 @@ impl PatcherApp {
         }
     }
 
+    fn steam_language(&self) -> SteamLanguage {
+        steam_language_for_ui(self.language())
+    }
+
     fn t(&self, key: &'static str) -> &'static str {
         tr(self.language(), key)
     }
@@ -478,36 +481,39 @@ impl PatcherApp {
         let Some(workshop_id) = self.selected_workshop_id() else {
             return;
         };
+        let steam_language = self.steam_language();
+        let cache_key = workshop_details_cache_key(workshop_id, steam_language);
 
         {
             let Ok(cache) = self.details_cache.lock() else {
                 return;
             };
-            if cache.contains_key(&workshop_id) {
+            if cache.contains_key(&cache_key) {
                 return;
             }
         }
 
         if let Ok(mut cache) = self.details_cache.lock() {
-            cache.insert(workshop_id, WorkshopDetailsState::Loading);
+            cache.insert(cache_key, WorkshopDetailsState::Loading);
         }
 
         let cache = self.details_cache.clone();
         thread::spawn(move || {
-            let result = fetch_workshop_details(workshop_id)
+            let result = fetch_workshop_details(workshop_id, steam_language)
                 .map(WorkshopDetailsState::Ready)
                 .unwrap_or_else(|error| WorkshopDetailsState::Error(error.to_string()));
 
             if let Ok(mut cache) = cache.lock() {
-                cache.insert(workshop_id, result);
+                cache.insert(cache_key, result);
             }
         });
     }
 
     fn retry_selected_details(&mut self) {
         if let Some(workshop_id) = self.selected_workshop_id() {
+            let cache_key = workshop_details_cache_key(workshop_id, self.steam_language());
             if let Ok(mut cache) = self.details_cache.lock() {
-                cache.remove(&workshop_id);
+                cache.remove(&cache_key);
             }
             self.preview_textures.remove(&workshop_id);
             self.preview_failures.remove(&workshop_id);
@@ -526,7 +532,37 @@ impl PatcherApp {
             return;
         };
         let enabled = !installed_mod.enabled;
-        if let Err(error) = set_mod_enabled(&installed_mod.path, enabled) {
+        self.set_mod_enabled_at(index, enabled);
+    }
+
+    fn set_mod_enabled_by_path(&mut self, path: &Path, enabled: bool) {
+        let Some(index) = self
+            .available_mods
+            .iter()
+            .position(|installed_mod| installed_mod.path == path)
+        else {
+            return;
+        };
+
+        self.selected_mod_index = Some(index);
+        if !matches!(self.state, AppState::Syncing) {
+            self.state = AppState::Idle;
+        }
+        self.set_mod_enabled_at(index, enabled);
+        self.apply_selected_mod();
+        self.ensure_selected_details_requested();
+    }
+
+    fn set_mod_enabled_at(&mut self, index: usize, enabled: bool) {
+        let Some(installed_mod) = self.available_mods.get(index) else {
+            return;
+        };
+        if installed_mod.enabled == enabled {
+            return;
+        }
+
+        let path = installed_mod.path.clone();
+        if let Err(error) = set_mod_enabled(&path, enabled) {
             self.status_message = format!("{}: {}", self.t("toggle_mod_failed"), error);
             return;
         }
@@ -727,10 +763,10 @@ impl PatcherApp {
     }
 
     fn can_batch_update_mod(&self, installed_mod: &InstalledMod) -> bool {
-        let Some(workshop_id) = installed_mod.workshop_id.and_then(valid_workshop_id) else {
-            return false;
-        };
-        !self.auto_update_exclusions.contains(&workshop_id)
+        installed_mod
+            .workshop_id
+            .and_then(valid_workshop_id)
+            .is_some()
     }
 
     fn sort_available_mods(&mut self) {
@@ -785,11 +821,6 @@ impl PatcherApp {
             .map(|installed_mod| installed_mod.path.clone());
         if excluded {
             self.auto_update_exclusions.insert(workshop_id);
-            for installed_mod in &self.available_mods {
-                if installed_mod.workshop_id == Some(workshop_id) {
-                    self.checked_update_paths.remove(&installed_mod.path);
-                }
-            }
         } else {
             self.auto_update_exclusions.remove(&workshop_id);
         }
@@ -1073,6 +1104,7 @@ impl PatcherApp {
             }
             ui.checkbox(&mut self.show_log, show_log_label);
             ui.label(language_label);
+            let mut language_changed = false;
             egui::ComboBox::from_id_source("language_mode")
                 .selected_text(self.language_mode.label(language))
                 .show_ui(ui, |ui| {
@@ -1086,9 +1118,17 @@ impl PatcherApp {
                             .changed()
                         {
                             let _ = save_language_mode(self.language_mode);
+                            language_changed = true;
                         }
                     }
                 });
+            if language_changed {
+                self.details_cache
+                    .lock()
+                    .ok()
+                    .map(|mut cache| cache.clear());
+                self.refresh_mods();
+            }
             ui.separator();
             self.render_app_update_status(ui);
         });
@@ -1278,55 +1318,47 @@ impl PatcherApp {
         } else {
             let list_inner_margin = 7.0;
             let list_inner_height = (list_height - list_inner_margin * 2.0).max(120.0);
+            let mut dropped_mod = None;
             ui.columns(2, |columns| {
-                columns[0].set_min_height(list_height);
-                opaque_section_frame(&columns[0])
-                    .inner_margin(egui::Margin::same(list_inner_margin))
-                    .show(&mut columns[0], |ui| {
-                        ui.set_min_height(list_inner_height);
-                        egui::ScrollArea::vertical()
-                            .id_source("enabled_mods_scroll")
-                            .max_height(list_inner_height)
-                            .min_scrolled_height(list_inner_height)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.set_max_width(ui.available_width());
-                                self.render_mod_list_section(
-                                    ui,
-                                    language,
-                                    tr(language, "enabled_mods"),
-                                    tr(language, "no_enabled_mods"),
-                                    &enabled_indices,
-                                    &mut clicked_mod_index,
-                                    &mut toggle_mod_index,
-                                );
-                            });
-                    });
+                if let Some(payload) = self.render_mod_drop_column(
+                    &mut columns[0],
+                    language,
+                    tr(language, "enabled_mods"),
+                    tr(language, "no_enabled_mods"),
+                    &enabled_indices,
+                    true,
+                    list_height,
+                    list_inner_margin,
+                    list_inner_height,
+                    "enabled_mods_scroll",
+                    &mut clicked_mod_index,
+                    &mut toggle_mod_index,
+                ) {
+                    dropped_mod = Some((payload, true));
+                }
 
-                columns[1].set_min_height(list_height);
-                opaque_section_frame(&columns[1])
-                    .inner_margin(egui::Margin::same(list_inner_margin))
-                    .show(&mut columns[1], |ui| {
-                        ui.set_min_height(list_inner_height);
-                        egui::ScrollArea::vertical()
-                            .id_source("disabled_mods_scroll")
-                            .max_height(list_inner_height)
-                            .min_scrolled_height(list_inner_height)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.set_max_width(ui.available_width());
-                                self.render_mod_list_section(
-                                    ui,
-                                    language,
-                                    tr(language, "disabled_mods"),
-                                    tr(language, "no_disabled_mods"),
-                                    &disabled_indices,
-                                    &mut clicked_mod_index,
-                                    &mut toggle_mod_index,
-                                );
-                            });
-                    });
+                if let Some(payload) = self.render_mod_drop_column(
+                    &mut columns[1],
+                    language,
+                    tr(language, "disabled_mods"),
+                    tr(language, "no_disabled_mods"),
+                    &disabled_indices,
+                    false,
+                    list_height,
+                    list_inner_margin,
+                    list_inner_height,
+                    "disabled_mods_scroll",
+                    &mut clicked_mod_index,
+                    &mut toggle_mod_index,
+                ) {
+                    dropped_mod = Some((payload, false));
+                }
             });
+            if let Some((payload, target_enabled)) = dropped_mod {
+                if payload.enabled != target_enabled {
+                    self.set_mod_enabled_by_path(&payload.path, target_enabled);
+                }
+            }
         }
 
         ui.add_space(8.0);
@@ -1377,6 +1409,50 @@ impl PatcherApp {
         }
     }
 
+    fn render_mod_drop_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        language: UiLanguage,
+        title: &str,
+        empty_label: &str,
+        indices: &[usize],
+        target_enabled: bool,
+        list_height: f32,
+        list_inner_margin: f32,
+        list_inner_height: f32,
+        scroll_id: &'static str,
+        clicked_mod_index: &mut Option<usize>,
+        toggle_mod_index: &mut Option<usize>,
+    ) -> Option<ModDragPayload> {
+        ui.set_min_height(list_height);
+        let frame = mod_list_section_frame(target_enabled)
+            .inner_margin(egui::Margin::same(list_inner_margin));
+        let inner = frame.show(ui, |ui| {
+            ui.set_min_height(list_inner_height);
+            egui::ScrollArea::vertical()
+                .id_source(scroll_id)
+                .max_height(list_inner_height)
+                .min_scrolled_height(list_inner_height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_max_width(ui.available_width());
+                    self.render_mod_list_section(
+                        ui,
+                        language,
+                        title,
+                        empty_label,
+                        indices,
+                        clicked_mod_index,
+                        toggle_mod_index,
+                    );
+                });
+        });
+
+        paint_mod_drop_feedback(ui, &inner.response, target_enabled);
+        let payload = inner.response.dnd_release_payload::<ModDragPayload>();
+        payload.map(|payload| (*payload).clone())
+    }
+
     fn render_mod_list_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -1405,6 +1481,7 @@ impl PatcherApp {
                 continue;
             };
             let selected = self.selected_mod_index == Some(*index);
+            let enabled = installed_mod.enabled;
             let path = installed_mod.path.clone();
             let can_batch_update = self.can_batch_update_mod(installed_mod);
             let label = installed_mod.row_label(language);
@@ -1431,6 +1508,10 @@ impl PatcherApp {
             } else {
                 None
             };
+            let drag_payload = ModDragPayload {
+                path: path.clone(),
+                enabled,
+            };
             ui.horizontal(|ui| {
                 let mut checked = self.checked_update_paths.contains(&path);
                 let checkbox_response = ui
@@ -1456,7 +1537,14 @@ impl PatcherApp {
                 );
                 let response = ui
                     .selectable_label(selected, text)
-                    .on_hover_text(tr(language, "double_click_toggle_mod"));
+                    .on_hover_text(tr(language, "double_click_toggle_mod"))
+                    .interact(egui::Sense::click_and_drag());
+                if response.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), drag_payload);
+                }
+                if response.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
                 if response.clicked() {
                     *clicked_mod_index = Some(*index);
                 }
@@ -1490,11 +1578,13 @@ impl PatcherApp {
             ui.label(self.t("select_mod"));
             return;
         };
+        let steam_language = self.steam_language();
         let details_state = selected.workshop_id.and_then(|workshop_id| {
+            let cache_key = workshop_details_cache_key(workshop_id, steam_language);
             self.details_cache
                 .lock()
                 .ok()
-                .and_then(|cache| cache.get(&workshop_id).cloned())
+                .and_then(|cache| cache.get(&cache_key).cloned())
         });
 
         render_selected_title(ui, &selected, details_state.as_ref());
@@ -2236,8 +2326,8 @@ impl PatcherApp {
                         self.start_patching();
                     }
 
-                    let can_update_all = !self.checked_update_indices().is_empty();
                     let update_all_indices = self.update_all_indices(self.force_update_enabled);
+                    let can_update_all = !update_all_indices.is_empty();
                     if ui
                         .add_enabled(
                             can_update_all,
@@ -2749,11 +2839,13 @@ impl eframe::App for PatcherApp {
         self.sync_state_from_logs();
         self.sync_app_update_notice();
         self.ensure_selected_details_requested();
+        let steam_language = self.steam_language();
         if self.selected_workshop_id().is_some_and(|workshop_id| {
+            let cache_key = workshop_details_cache_key(workshop_id, steam_language);
             self.details_cache
                 .lock()
                 .ok()
-                .and_then(|cache| cache.get(&workshop_id).cloned())
+                .and_then(|cache| cache.get(&cache_key).cloned())
                 .is_some_and(|state| matches!(state, WorkshopDetailsState::Loading))
         }) {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -2806,12 +2898,17 @@ impl eframe::App for PatcherApp {
 }
 
 pub fn run() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(APP_TITLE)
+        .with_inner_size([1020.0, 760.0])
+        .with_min_inner_size([MIN_VISIBLE_WIDTH, MIN_VISIBLE_HEIGHT])
+        .with_resizable(true);
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(APP_TITLE)
-            .with_inner_size([1020.0, 760.0])
-            .with_min_inner_size([MIN_VISIBLE_WIDTH, MIN_VISIBLE_HEIGHT])
-            .with_resizable(true),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -2830,6 +2927,12 @@ pub fn run() -> eframe::Result<()> {
             Box::new(PatcherApp::default())
         }),
     )
+}
+
+fn app_icon() -> Option<Arc<egui::IconData>> {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/app-icon-256.png"))
+        .ok()
+        .map(Arc::new)
 }
 
 fn install_system_fonts(ctx: &egui::Context) {
@@ -2942,9 +3045,10 @@ fn run_dependency_check(game_path: Option<PathBuf>, install_steamcmd: bool) -> D
         find_steamcmd()
     };
 
-    let steam_web_api_error = fetch_workshop_summaries(&[CONCH_BLESSING_WORKSHOP_ID])
-        .err()
-        .map(|error| error.to_string());
+    let steam_web_api_error =
+        fetch_workshop_summaries(&[CONCH_BLESSING_WORKSHOP_ID], SteamLanguage::ENGLISH)
+            .err()
+            .map(|error| error.to_string());
 
     DependencyReport {
         steam_path,
@@ -2982,10 +3086,51 @@ fn dependency_row(ui: &mut egui::Ui, label: &str, ok: bool, value: String, langu
     ui.end_row();
 }
 
-fn opaque_section_frame(ui: &egui::Ui) -> egui::Frame {
+fn mod_list_section_frame(enabled_column: bool) -> egui::Frame {
+    let (fill, stroke) = if enabled_column {
+        (
+            egui::Color32::from_rgb(22, 31, 27),
+            egui::Color32::from_rgb(48, 68, 57),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(32, 26, 28),
+            egui::Color32::from_rgb(70, 50, 55),
+        )
+    };
+
     egui::Frame::none()
-        .fill(ui.visuals().panel_fill)
-        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke))
+}
+
+fn paint_mod_drop_feedback(ui: &egui::Ui, response: &egui::Response, target_enabled: bool) {
+    let Some(payload) = response.dnd_hover_payload::<ModDragPayload>() else {
+        return;
+    };
+    let accepting = payload.enabled != target_enabled;
+    let (fill, stroke) = match (target_enabled, accepting) {
+        (true, true) => (
+            egui::Color32::from_rgba_unmultiplied(70, 120, 85, 36),
+            egui::Color32::from_rgb(82, 150, 105),
+        ),
+        (false, true) => (
+            egui::Color32::from_rgba_unmultiplied(130, 72, 78, 34),
+            egui::Color32::from_rgb(160, 94, 102),
+        ),
+        _ => (
+            egui::Color32::TRANSPARENT,
+            egui::Color32::from_rgb(95, 95, 95),
+        ),
+    };
+
+    let rect = response.rect.shrink(1.0);
+    let rounding = egui::Rounding::same(4.0);
+    if fill != egui::Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, rounding, fill);
+    }
+    ui.painter()
+        .rect_stroke(rect, rounding, egui::Stroke::new(1.5, stroke));
 }
 
 fn mod_row_text(
@@ -3444,7 +3589,7 @@ fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bbcode_inline, BbcodeSegment};
+    use super::{online_update_status, parse_bbcode_inline, BbcodeSegment, ModUpdateStatus};
 
     #[test]
     fn parses_plain_bbcode_image_as_image_segment() {
@@ -3467,6 +3612,30 @@ mod tests {
                 if url == "https://example.test/image.png"
                     && target_url.as_deref() == Some("https://example.test/page")
         ));
+    }
+
+    #[test]
+    fn online_status_marks_remote_newer_timestamp_as_outdated() {
+        assert_eq!(
+            online_update_status(Some(100), Some(101)),
+            ModUpdateStatus::Outdated
+        );
+    }
+
+    #[test]
+    fn online_status_marks_current_local_timestamp_as_latest() {
+        assert_eq!(
+            online_update_status(Some(101), Some(100)),
+            ModUpdateStatus::Latest
+        );
+    }
+
+    #[test]
+    fn online_status_uses_online_available_when_timestamp_is_missing() {
+        assert_eq!(
+            online_update_status(Some(100), None),
+            ModUpdateStatus::OnlineAvailable
+        );
     }
 }
 
@@ -3616,6 +3785,20 @@ fn system_language() -> UiLanguage {
         .unwrap_or(UiLanguage::English)
 }
 
+fn steam_language_for_ui(language: UiLanguage) -> SteamLanguage {
+    match language {
+        UiLanguage::Korean => SteamLanguage::KOREAN,
+        UiLanguage::English => SteamLanguage::ENGLISH,
+    }
+}
+
+fn workshop_details_cache_key(
+    workshop_id: u64,
+    language: SteamLanguage,
+) -> WorkshopDetailsCacheKey {
+    (workshop_id, language.community_code)
+}
+
 fn status_sentence(installed_mod: &InstalledMod, language: UiLanguage) -> String {
     let name = installed_mod.display_name();
     let local = installed_mod.version_label();
@@ -3623,15 +3806,42 @@ fn status_sentence(installed_mod: &InstalledMod, language: UiLanguage) -> String
 
     match language {
         UiLanguage::Korean => match installed_mod.update_status {
-            ModUpdateStatus::Latest => {
-                format!("최신: {}의 로컬 버전 {}와 Steam 버전 {}가 같습니다.", name, local, steam)
-            }
-            ModUpdateStatus::Outdated => {
-                format!(
-                    "업데이트 필요: {}의 로컬 버전은 {}, Steam 버전은 {}입니다.",
-                    name, local, steam
-                )
-            }
+            ModUpdateStatus::Latest => match installed_mod.steam_version.as_deref() {
+                Some(steam) => {
+                    format!(
+                        "최신: {}의 로컬 버전 {}와 Steam 버전 {}가 같습니다.",
+                        name, local, steam
+                    )
+                }
+                None => {
+                    let updated = installed_mod
+                        .steam_updated_at
+                        .map(|timestamp| format_timestamp(Some(timestamp)))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    format!(
+                        "최신: {}는 Steam 업데이트 시각 {} 기준으로 로컬 파일이 최신입니다. 정확한 버전 비교는 Steam 파일 다운로드 후 가능합니다.",
+                        name, updated
+                    )
+                }
+            },
+            ModUpdateStatus::Outdated => match installed_mod.steam_version.as_deref() {
+                Some(steam) => {
+                    format!(
+                        "업데이트 필요: {}의 로컬 버전은 {}, Steam 버전은 {}입니다.",
+                        name, local, steam
+                    )
+                }
+                None => {
+                    let updated = installed_mod
+                        .steam_updated_at
+                        .map(|timestamp| format_timestamp(Some(timestamp)))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    format!(
+                        "업데이트 필요: {}는 Steam 업데이트 시각 {}이 로컬 파일보다 최신입니다.",
+                        name, updated
+                    )
+                }
+            },
             ModUpdateStatus::LocalNewer => {
                 format!(
                     "로컬 버전 높음: {}의 로컬 버전은 {}, Steam 버전은 {}입니다. Steam 버전으로 맞추기 전에 확인이 필요합니다.",
@@ -3648,30 +3858,50 @@ fn status_sentence(installed_mod: &InstalledMod, language: UiLanguage) -> String
                     name, updated
                 )
             }
-            ModUpdateStatus::MissingSteamCache => match installed_mod.workshop_id {
-                Some(workshop_id) => format!(
-                    "확인 불가: Steam이 Workshop {}를 아직 다운로드하지 않았습니다. 업데이트를 누르면 Steam에서 받아 적용합니다.",
-                    workshop_id
-                ),
-                None => format!("확인 불가: {}에 Workshop ID가 없습니다.", name),
-            },
             ModUpdateStatus::Unknown => {
-                format!("확인 불가: {}의 로컬/Steam 버전 정보를 비교할 수 없습니다.", name)
+                format!(
+                    "확인 불가: {}의 로컬/Steam 버전 정보를 비교할 수 없습니다.",
+                    name
+                )
             }
             ModUpdateStatus::LocalOnly => {
                 format!("로컬 전용: {}에 Workshop ID가 없습니다.", name)
             }
         },
         UiLanguage::English => match installed_mod.update_status {
-            ModUpdateStatus::Latest => {
-                format!("Latest: {} local {} matches Steam {}.", name, local, steam)
-            }
-            ModUpdateStatus::Outdated => {
-                format!(
-                    "Outdated: {} local version is {}, Steam version is {}.",
-                    name, local, steam
-                )
-            }
+            ModUpdateStatus::Latest => match installed_mod.steam_version.as_deref() {
+                Some(steam) => {
+                    format!("Latest: {} local {} matches Steam {}.", name, local, steam)
+                }
+                None => {
+                    let updated = installed_mod
+                        .steam_updated_at
+                        .map(|timestamp| format_timestamp(Some(timestamp)))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    format!(
+                        "Latest: {} local files are current against Steam updated at {}; exact version comparison requires downloading the Workshop files.",
+                        name, updated
+                    )
+                }
+            },
+            ModUpdateStatus::Outdated => match installed_mod.steam_version.as_deref() {
+                Some(steam) => {
+                    format!(
+                        "Outdated: {} local version is {}, Steam version is {}.",
+                        name, local, steam
+                    )
+                }
+                None => {
+                    let updated = installed_mod
+                        .steam_updated_at
+                        .map(|timestamp| format_timestamp(Some(timestamp)))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    format!(
+                        "Outdated: {} Steam updated at {} is newer than the local files.",
+                        name, updated
+                    )
+                }
+            },
             ModUpdateStatus::LocalNewer => {
                 format!(
                     "Local newer: {} local version is {}, Steam version is {}. Confirm before matching Steam.",
@@ -3688,15 +3918,11 @@ fn status_sentence(installed_mod: &InstalledMod, language: UiLanguage) -> String
                     name, updated
                 )
             }
-            ModUpdateStatus::MissingSteamCache => match installed_mod.workshop_id {
-                Some(workshop_id) => format!(
-                    "Unknown: Steam has not downloaded Workshop {} yet. Updating will download and apply it.",
-                    workshop_id
-                ),
-                None => format!("Unknown: {} has no Workshop ID.", name),
-            },
             ModUpdateStatus::Unknown => {
-                format!("Unknown: {} local and Steam versions could not be compared.", name)
+                format!(
+                    "Unknown: {} local and Steam versions could not be compared.",
+                    name
+                )
             }
             ModUpdateStatus::LocalOnly => {
                 format!("Local only: {} has no Workshop ID.", name)
@@ -3782,7 +4008,7 @@ fn tr(language: UiLanguage, key: &'static str) -> &'static str {
             "enabled_short" => "ON",
             "disabled_short" => "OFF",
             "update_checkbox_hint" => "체크 = 업데이트 대상 선택",
-            "double_click_toggle_mod" => "더블클릭으로 활성/비활성을 전환합니다.",
+            "double_click_toggle_mod" => "더블클릭하거나 반대 목록으로 드래그해서 활성/비활성을 전환합니다.",
             "folder" => "폴더",
             "mod_state" => "모드 상태",
             "enabled" => "활성화됨",
@@ -3926,7 +4152,7 @@ fn tr(language: UiLanguage, key: &'static str) -> &'static str {
             "enabled_short" => "ON",
             "disabled_short" => "OFF",
             "update_checkbox_hint" => "Check = include in updates",
-            "double_click_toggle_mod" => "Double-click to toggle enabled/disabled.",
+            "double_click_toggle_mod" => "Double-click or drag to the other list to toggle enabled/disabled.",
             "folder" => "Folder",
             "mod_state" => "Mod State",
             "enabled" => "Enabled",
@@ -4154,11 +4380,7 @@ fn open_steam_or_web(web_url: &str) -> anyhow::Result<()> {
     }
 }
 
-fn scan_installed_mods(
-    mods_path: &Path,
-    app_id: u32,
-    steam_roots: &[PathBuf],
-) -> Vec<InstalledMod> {
+fn scan_installed_mods(mods_path: &Path, language: SteamLanguage) -> Vec<InstalledMod> {
     let Ok(entries) = fs::read_dir(mods_path) else {
         return Vec::new();
     };
@@ -4176,12 +4398,11 @@ fn scan_installed_mods(
         let folder_name = entry.file_name().to_string_lossy().to_string();
         let metadata = read_local_metadata(&path).unwrap_or_default();
         let workshop_id = workshop_id_from_metadata(&folder_name, &metadata);
-        let (steam_version, update_status) = determine_update_status(
-            app_id,
-            workshop_id,
-            metadata.version.as_deref(),
-            steam_roots,
-        );
+        let update_status = if workshop_id.and_then(valid_workshop_id).is_some() {
+            ModUpdateStatus::Unknown
+        } else {
+            ModUpdateStatus::LocalOnly
+        };
 
         mods.push(InstalledMod {
             enabled: is_mod_enabled(&path),
@@ -4192,12 +4413,14 @@ fn scan_installed_mods(
             description: metadata.description,
             author: metadata.author,
             workshop_id,
-            steam_version,
+            steam_version: None,
             steam_title: None,
             steam_updated_at: None,
             update_status,
         });
     }
+
+    enrich_workshop_mods_from_steam(&mut mods, language);
 
     mods.sort_by(|left, right| {
         update_status_priority(&left.update_status)
@@ -4228,11 +4451,9 @@ fn set_mod_enabled(mod_path: &Path, enabled: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-fn enrich_missing_cache_mods_from_steam(mods: &mut [InstalledMod]) {
+fn enrich_workshop_mods_from_steam(mods: &mut [InstalledMod], language: SteamLanguage) {
     let ids = mods
         .iter()
-        .filter(|installed_mod| installed_mod.update_status == ModUpdateStatus::MissingSteamCache)
         .filter_map(|installed_mod| installed_mod.workshop_id)
         .filter_map(valid_workshop_id)
         .collect::<Vec<_>>();
@@ -4241,7 +4462,7 @@ fn enrich_missing_cache_mods_from_steam(mods: &mut [InstalledMod]) {
         return;
     }
 
-    let Ok(summaries) = fetch_workshop_summaries(&ids) else {
+    let Ok(summaries) = fetch_workshop_summaries(&ids, language) else {
         return;
     };
 
@@ -4255,9 +4476,10 @@ fn enrich_missing_cache_mods_from_steam(mods: &mut [InstalledMod]) {
 
         installed_mod.steam_title = Some(summary.title.clone());
         installed_mod.steam_updated_at = summary.time_updated;
-        if installed_mod.update_status == ModUpdateStatus::MissingSteamCache {
-            installed_mod.update_status = ModUpdateStatus::OnlineAvailable;
-        }
+        installed_mod.update_status = online_update_status(
+            newest_mod_file_timestamp(&installed_mod.path),
+            summary.time_updated,
+        );
     }
 }
 
@@ -4267,39 +4489,49 @@ fn read_local_metadata(mod_path: &Path) -> Option<LocalMetadata> {
     quick_xml::de::from_str(&content).ok()
 }
 
-fn determine_update_status(
-    app_id: u32,
-    workshop_id: Option<u64>,
-    local_version: Option<&str>,
-    steam_roots: &[PathBuf],
-) -> (Option<String>, ModUpdateStatus) {
-    let Some(workshop_id) = workshop_id else {
-        return (None, ModUpdateStatus::LocalOnly);
-    };
+fn online_update_status(
+    local_updated_at: Option<u64>,
+    steam_updated_at: Option<u64>,
+) -> ModUpdateStatus {
+    match (local_updated_at, steam_updated_at) {
+        (Some(local), Some(steam)) if steam > local => ModUpdateStatus::Outdated,
+        (Some(_), Some(_)) => ModUpdateStatus::Latest,
+        _ => ModUpdateStatus::OnlineAvailable,
+    }
+}
 
-    let Some(cache_path) = find_cached_workshop_item(app_id, workshop_id, steam_roots) else {
-        return (None, ModUpdateStatus::MissingSteamCache);
-    };
+fn newest_mod_file_timestamp(mod_path: &Path) -> Option<u64> {
+    walkdir::WalkDir::new(mod_path)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| {
+            entry
+                .path()
+                .strip_prefix(mod_path)
+                .ok()
+                .is_some_and(|relative_path| !should_ignore_local_timestamp(relative_path))
+        })
+        .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+        .filter_map(system_time_to_unix_seconds)
+        .max()
+}
 
-    let Some(cache_metadata) = read_local_metadata(&cache_path) else {
-        return (None, ModUpdateStatus::Unknown);
-    };
+fn should_ignore_local_timestamp(relative_path: &Path) -> bool {
+    let file_name = relative_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
 
-    let local = normalize_version(local_version);
-    let steam = normalize_version(cache_metadata.version.as_deref());
-    let status = match (local.as_deref(), steam.as_deref()) {
-        (Some(local), Some(steam)) if local == steam => ModUpdateStatus::Latest,
-        (Some(local), Some(steam)) => match compare_version_strings(local, steam) {
-            Some(Ordering::Less) => ModUpdateStatus::Outdated,
-            Some(Ordering::Greater) => ModUpdateStatus::LocalNewer,
-            Some(Ordering::Equal) => ModUpdateStatus::Latest,
-            None => ModUpdateStatus::Unknown,
-        },
-        (None, Some(_)) => ModUpdateStatus::Outdated,
-        (Some(_), None) | (None, None) => ModUpdateStatus::Unknown,
-    };
+    file_name == ".DS_Store"
+        || file_name == "Thumbs.db"
+        || file_name.eq_ignore_ascii_case("disable.it")
+}
 
-    (steam, status)
+fn system_time_to_unix_seconds(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 fn update_status_priority(status: &ModUpdateStatus) -> u8 {
@@ -4307,10 +4539,9 @@ fn update_status_priority(status: &ModUpdateStatus) -> u8 {
         ModUpdateStatus::Outdated => 0,
         ModUpdateStatus::LocalNewer => 1,
         ModUpdateStatus::OnlineAvailable => 2,
-        ModUpdateStatus::MissingSteamCache => 3,
-        ModUpdateStatus::Unknown => 4,
-        ModUpdateStatus::Latest => 5,
-        ModUpdateStatus::LocalOnly => 6,
+        ModUpdateStatus::Unknown => 3,
+        ModUpdateStatus::Latest => 4,
+        ModUpdateStatus::LocalOnly => 5,
     }
 }
 
@@ -4326,63 +4557,8 @@ fn auto_update_exclusion_priority(installed_mod: &InstalledMod, exclusions: &Has
     }
 }
 
-fn normalize_version(version: Option<&str>) -> Option<String> {
-    version
-        .map(str::trim)
-        .filter(|version| !version.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 fn valid_workshop_id(workshop_id: u64) -> Option<u64> {
     (workshop_id > 0).then_some(workshop_id)
-}
-
-fn compare_version_strings(left: &str, right: &str) -> Option<Ordering> {
-    if left.trim() == right.trim() {
-        return Some(Ordering::Equal);
-    }
-
-    let left_parts = numeric_version_parts(left);
-    let right_parts = numeric_version_parts(right);
-    if left_parts.is_empty() || right_parts.is_empty() {
-        return None;
-    }
-
-    let len = left_parts.len().max(right_parts.len());
-    for index in 0..len {
-        let left = *left_parts.get(index).unwrap_or(&0);
-        let right = *right_parts.get(index).unwrap_or(&0);
-        match left.cmp(&right) {
-            Ordering::Equal => {}
-            ordering => return Some(ordering),
-        }
-    }
-
-    Some(Ordering::Equal)
-}
-
-fn numeric_version_parts(version: &str) -> Vec<u64> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-
-    for ch in version.chars() {
-        if ch.is_ascii_digit() {
-            current.push(ch);
-        } else if !current.is_empty() {
-            if let Ok(value) = current.parse::<u64>() {
-                parts.push(value);
-            }
-            current.clear();
-        }
-    }
-
-    if !current.is_empty() {
-        if let Ok(value) = current.parse::<u64>() {
-            parts.push(value);
-        }
-    }
-
-    parts
 }
 
 fn read_text_file(path: &Path) -> std::io::Result<String> {

@@ -1,6 +1,6 @@
 [package]
 name = "isaac-mod-manager"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 
 [dependencies]
@@ -22,3 +22,6 @@ scraper = "0.19"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.50"
+
+[build-dependencies]
+winresource = "0.1"

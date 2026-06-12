@@ -9,6 +9,24 @@ use std::time::Duration;
 const DETAILS_URL: &str =
     "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SteamLanguage {
+    pub web_api_code: &'static str,
+    pub community_code: &'static str,
+}
+
+impl SteamLanguage {
+    pub const ENGLISH: Self = Self {
+        web_api_code: "en",
+        community_code: "english",
+    };
+
+    pub const KOREAN: Self = Self {
+        web_api_code: "ko",
+        community_code: "koreana",
+    };
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkshopDetails {
     pub workshop_id: u64,
@@ -54,11 +72,16 @@ struct SteamProfile {
 
 #[derive(Default)]
 struct WorkshopPageInfo {
+    title: Option<String>,
+    description: Option<String>,
     creators: Vec<WorkshopCreator>,
     required_items: Vec<WorkshopRequiredItem>,
 }
 
-pub fn fetch_workshop_details(workshop_id: u64) -> Result<WorkshopDetails> {
+pub fn fetch_workshop_details(
+    workshop_id: u64,
+    language: SteamLanguage,
+) -> Result<WorkshopDetails> {
     let client = Client::builder()
         .user_agent("isaac_mod_manager")
         .timeout(Duration::from_secs(20))
@@ -69,6 +92,7 @@ pub fn fetch_workshop_details(workshop_id: u64) -> Result<WorkshopDetails> {
         .form(&[
             ("itemcount", "1".to_string()),
             ("publishedfileids[0]", workshop_id.to_string()),
+            ("language", language.web_api_code.to_string()),
         ])
         .send()
         .context("Failed to request Steam Workshop details")?
@@ -115,12 +139,13 @@ pub fn fetch_workshop_details(workshop_id: u64) -> Result<WorkshopDetails> {
         .unwrap_or_default();
 
     let creator_steam_id = value_string(item, "creator");
-    let mut page_info = fetch_workshop_page_info(&client, workshop_id).unwrap_or_default();
-    if page_info.creators.is_empty() {
+    let page_info = fetch_workshop_page_info(&client, workshop_id, language).unwrap_or_default();
+    let mut creators = page_info.creators;
+    if creators.is_empty() {
         if let Some(steam_id) = creator_steam_id.as_deref() {
             let name = fetch_steam_profile_name(&client, steam_id)
                 .unwrap_or_else(|_| steam_id.to_string());
-            page_info.creators.push(WorkshopCreator {
+            creators.push(WorkshopCreator {
                 name,
                 profile_url: steam_profile_url(steam_id),
             });
@@ -129,10 +154,15 @@ pub fn fetch_workshop_details(workshop_id: u64) -> Result<WorkshopDetails> {
 
     Ok(WorkshopDetails {
         workshop_id,
-        title: value_string(item, "title").unwrap_or_else(|| format!("Workshop {}", workshop_id)),
-        description: value_string(item, "description")
-            .map(|description| clean_description(&description))
-            .unwrap_or_else(|| "No description provided.".to_string()),
+        title: page_info
+            .title
+            .or_else(|| value_string(item, "title"))
+            .unwrap_or_else(|| format!("Workshop {}", workshop_id)),
+        description: page_info.description.unwrap_or_else(|| {
+            value_string(item, "description")
+                .map(|description| clean_description(&description))
+                .unwrap_or_else(|| "No description provided.".to_string())
+        }),
         preview_url,
         preview_image,
         time_created: value_u64(item, "time_created"),
@@ -142,12 +172,15 @@ pub fn fetch_workshop_details(workshop_id: u64) -> Result<WorkshopDetails> {
         favorited: value_u64(item, "favorited"),
         views: value_u64(item, "views"),
         tags,
-        creators: page_info.creators,
+        creators,
         required_items: page_info.required_items,
     })
 }
 
-pub fn fetch_workshop_summaries(workshop_ids: &[u64]) -> Result<HashMap<u64, WorkshopSummary>> {
+pub fn fetch_workshop_summaries(
+    workshop_ids: &[u64],
+    language: SteamLanguage,
+) -> Result<HashMap<u64, WorkshopSummary>> {
     let mut ids = workshop_ids
         .iter()
         .copied()
@@ -163,7 +196,10 @@ pub fn fetch_workshop_summaries(workshop_ids: &[u64]) -> Result<HashMap<u64, Wor
 
     let mut output = HashMap::new();
     for chunk in ids.chunks(100) {
-        let mut form = vec![("itemcount".to_string(), chunk.len().to_string())];
+        let mut form = vec![
+            ("itemcount".to_string(), chunk.len().to_string()),
+            ("language".to_string(), language.web_api_code.to_string()),
+        ];
         for (index, workshop_id) in chunk.iter().enumerate() {
             form.push((
                 format!("publishedfileids[{}]", index),
@@ -211,12 +247,17 @@ pub fn fetch_workshop_summaries(workshop_ids: &[u64]) -> Result<HashMap<u64, Wor
     Ok(output)
 }
 
-fn fetch_workshop_page_info(client: &Client, workshop_id: u64) -> Result<WorkshopPageInfo> {
+fn fetch_workshop_page_info(
+    client: &Client,
+    workshop_id: u64,
+    language: SteamLanguage,
+) -> Result<WorkshopPageInfo> {
     let html = client
-        .get(format!(
-            "https://steamcommunity.com/sharedfiles/filedetails/?id={}&l=english",
-            workshop_id
-        ))
+        .get("https://steamcommunity.com/sharedfiles/filedetails/")
+        .query(&[
+            ("id", workshop_id.to_string()),
+            ("l", language.community_code.to_string()),
+        ])
         .send()
         .context("Failed to request Steam Workshop page")?
         .error_for_status()
@@ -226,9 +267,27 @@ fn fetch_workshop_page_info(client: &Client, workshop_id: u64) -> Result<Worksho
 
     let document = Html::parse_document(&html);
     Ok(WorkshopPageInfo {
+        title: parse_workshop_title(&document),
+        description: parse_workshop_description(&document),
         creators: parse_workshop_creators(&document),
         required_items: parse_required_items(&document),
     })
+}
+
+fn parse_workshop_title(document: &Html) -> Option<String> {
+    let selector = Selector::parse(".workshopItemTitle").expect("valid selector");
+    document
+        .select(&selector)
+        .next()
+        .and_then(|element| normalized_element_text(element))
+}
+
+fn parse_workshop_description(document: &Html) -> Option<String> {
+    let selector = Selector::parse(".workshopItemDescription").expect("valid selector");
+    document
+        .select(&selector)
+        .next()
+        .and_then(|element| normalized_element_text(element))
 }
 
 fn parse_workshop_creators(document: &Html) -> Vec<WorkshopCreator> {
@@ -416,6 +475,17 @@ fn value_u64(value: &Value, key: &str) -> Option<u64> {
         Value::String(text) => text.trim().parse().ok(),
         _ => None,
     })
+}
+
+fn normalized_element_text(element: scraper::ElementRef<'_>) -> Option<String> {
+    let text = element
+        .text()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = clean_description(&text);
+    (!text.is_empty()).then_some(text)
 }
 
 fn clean_description(description: &str) -> String {
