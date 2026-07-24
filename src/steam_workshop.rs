@@ -72,57 +72,96 @@ impl SteamWorkshopClient {
         let cached_path =
             find_cached_workshop_item(self.app_id, self.workshop_id, &self.steam_library_roots);
         if let Some(path) = &cached_path {
-            let action = if self.force_download {
-                "Force update enabled; validating Workshop content before using cached files"
-            } else {
-                "Validating Workshop content before using cached files"
-            };
-            log(logger, format!("{}: {}", action, path.display()));
             log_cache_freshness(path, workshop_updated_at, logger);
         }
 
+        // Primary path: reuse whatever the already-logged-in Steam client has
+        // downloaded. We intentionally never ask for separate Steam credentials
+        // or add a login flow — the logged-in client's on-disk cache is the
+        // authoritative source. Isaac (250900) also blocks anonymous SteamCMD
+        // workshop downloads, so this cache is usually the only thing that works,
+        // and it covers public, friends-only, and private items alike. Applying
+        // it directly (instead of re-validating and opening Steam pages) is what
+        // avoids the confusing "update this dependency in Steam" pop-ups.
+        if !self.force_download {
+            if let Some(path) = &cached_path {
+                log(
+                    logger,
+                    format!(
+                        "Using the logged-in Steam client's workshop cache: {}",
+                        path.display()
+                    ),
+                );
+                return Ok(path.clone());
+            }
+        }
+
+        // Either a forced refresh was requested, or nothing is cached yet.
+        // Try a cheap anonymous SteamCMD download; it only succeeds for public
+        // items on apps that allow it, but it is harmless to attempt.
         match self.try_steamcmd_download(logger) {
             Ok(SteamCmdDownload::Ready(path)) => return Ok(path),
             Ok(SteamCmdDownload::AnonymousFailed) => {}
             Err(error) => {
-                log(
-                    logger,
-                    format!("SteamCMD workshop download failed: {}", error),
-                );
+                log(logger, format!("SteamCMD workshop download failed: {}", error));
             }
         }
 
-        if let Some(path) =
-            find_cached_workshop_item(self.app_id, self.workshop_id, &self.steam_library_roots)
-        {
-            if cache_is_fresh(&path, workshop_updated_at) {
-                log(
-                    logger,
-                    format!(
-                        "SteamCMD did not provide fresh content; using verified Steam client workshop cache: {}",
-                        path.display()
-                    ),
-                );
+        // Re-scan: a subscription/update in the logged-in client may have landed.
+        let cached_path =
+            find_cached_workshop_item(self.app_id, self.workshop_id, &self.steam_library_roots);
+
+        // Forced refresh with an existing cache: nudge the logged-in Steam client
+        // to update the item (via steam://) and wait briefly for a newer copy,
+        // but never fail — fall back to the existing cache below.
+        if self.force_download && cached_path.is_some() {
+            log(
+                logger,
+                "Anonymous refresh unavailable; asking the logged-in Steam client to update this item...".to_string(),
+            );
+            open_workshop_page(self.workshop_id, logger)?;
+            if let Some(path) = wait_for_steam_client_cache(
+                self.app_id,
+                self.workshop_id,
+                &self.steam_library_roots,
+                self.steam_client_download_wait,
+                workshop_updated_at,
+                logger,
+            ) {
                 return Ok(path);
             }
+        }
 
+        // Fall back to whatever the logged-in Steam client already has, even if it
+        // might be slightly outdated. Applying the existing content beats failing.
+        if let Some(path) = cached_path {
             log(
                 logger,
                 format!(
-                    "Steam client workshop cache is stale or unverified, not applying it yet: {}",
+                    "Using the logged-in Steam client's existing cache (update it in Steam if you need the latest): {}",
                     path.display()
                 ),
             );
+            return Ok(path);
         }
 
+        // No local copy at all. The logged-in Steam account has to subscribe /
+        // download it once. This still reuses the existing logged-in session —
+        // there is no separate login — it just needs the content to exist locally.
+        if workshop_updated_at.is_none() {
+            log(
+                logger,
+                "This Workshop item is not publicly listed (friends-only, private, or hidden). The logged-in Steam account must have access and subscribe it once.".to_string(),
+            );
+        }
         log(
             logger,
-            "SteamCMD anonymous download failed. Opening the Workshop page in the logged-in Steam client...".to_string(),
+            "No local copy found. Opening the Workshop page in the logged-in Steam client so you can subscribe/download it...".to_string(),
         );
         open_workshop_page(self.workshop_id, logger)?;
         log(
             logger,
-            "Waiting for Steam client workshop cache to update. If the item is already subscribed, wait for Steam downloads to finish.".to_string(),
+            "Waiting for the Steam client to finish downloading. If it is already subscribed, wait for Steam downloads to finish.".to_string(),
         );
         if let Some(path) = wait_for_steam_client_cache(
             self.app_id,
@@ -137,7 +176,7 @@ impl SteamWorkshopClient {
 
         log(logger, format!("SUBSCRIBE_REQUIRED:{}", self.workshop_id));
         Err(anyhow::anyhow!(
-            "Steam client workshop cache is missing or stale. Make sure the logged-in Steam account can access this item, subscribe/download it in Steam, wait for Steam downloads to finish, then retry."
+            "This item has no local copy yet. Make sure the logged-in Steam account can access it, subscribe/download it in Steam, wait for Steam downloads to finish, then retry."
         ))
     }
 
@@ -221,7 +260,7 @@ fn wait_for_steam_client_cache(
 ) -> Option<PathBuf> {
     if wait.is_zero() {
         return find_cached_workshop_item(app_id, workshop_id, steam_library_roots)
-            .filter(|path| cache_is_fresh(path, workshop_updated_at));
+            .filter(|path| cache_is_usable(path, workshop_updated_at));
     }
 
     let started = Instant::now();
@@ -229,7 +268,7 @@ fn wait_for_steam_client_cache(
 
     loop {
         if let Some(path) = find_cached_workshop_item(app_id, workshop_id, steam_library_roots) {
-            if cache_is_fresh(&path, workshop_updated_at) {
+            if cache_is_usable(&path, workshop_updated_at) {
                 log(
                     logger,
                     format!("Steam client workshop cache is ready: {}", path.display()),
@@ -285,6 +324,23 @@ fn cache_is_fresh(cache_path: &Path, workshop_updated_at: Option<SystemTime>) ->
     cache_updated_at
         .checked_add(CACHE_FRESHNESS_TOLERANCE)
         .is_some_and(|cache_time| cache_time >= workshop_updated_at)
+}
+
+/// Whether a cached workshop directory should be applied.
+///
+/// When Steam's public Web API can report the item's update time
+/// (`workshop_updated_at` is `Some`), we require the cache to be at least that
+/// fresh. Friends-only, private, and hidden items are invisible to the public
+/// Web API, so `workshop_updated_at` is `None`; anonymous verification is then
+/// impossible, and the only way the content can exist locally is if the
+/// logged-in Steam account already subscribed/downloaded it. In that case we
+/// trust the existing cache as-is instead of rejecting it as unverified.
+fn cache_is_usable(cache_path: &Path, workshop_updated_at: Option<SystemTime>) -> bool {
+    if workshop_updated_at.is_some() {
+        cache_is_fresh(cache_path, workshop_updated_at)
+    } else {
+        is_usable_workshop_dir(cache_path)
+    }
 }
 
 fn log_cache_freshness(

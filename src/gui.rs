@@ -1659,10 +1659,23 @@ impl PatcherApp {
                 self.render_workshop_details(ui, ctx, &details);
             }
             Some(WorkshopDetailsState::Error(error)) => {
-                ui.colored_label(
-                    egui::Color32::from_rgb(210, 80, 80),
-                    format!("{}: {}", self.t("workshop_details_failed"), error),
-                );
+                // Friends-only / private / hidden items return an error from the
+                // public Steam API (result 9). Fall back to the local metadata we
+                // already have so the panel stays useful instead of just erroring.
+                if let Some(description) = selected.description.as_deref() {
+                    ui.label(egui::RichText::new(self.t("description")).strong());
+                    render_description_text_box(ui, description);
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(180, 140, 60),
+                        self.t("details_local_fallback"),
+                    );
+                } else {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(210, 80, 80),
+                        format!("{}: {}", self.t("workshop_details_failed"), error),
+                    );
+                }
                 if ui.button(self.t("retry_details")).clicked() {
                     self.retry_selected_details();
                 }
@@ -4084,6 +4097,7 @@ fn tr(language: UiLanguage, key: &'static str) -> &'static str {
             "already_up_to_date" => "최신: 이미 최신 버전입니다.",
             "update_failed" => "업데이트 실패.",
             "workshop_details_failed" => "Workshop 상세정보를 불러오지 못했습니다",
+            "details_local_fallback" => "friends-only 또는 비공개 아이템이라 온라인 상세정보를 불러올 수 없어, 로컬 정보를 표시합니다.",
             "open_workshop_failed" => "Steam Workshop 페이지를 열지 못했습니다",
             "open_profile_failed" => "Steam 프로필을 열지 못했습니다",
             "open_folder_failed" => "폴더를 열지 못했습니다",
@@ -4228,6 +4242,7 @@ fn tr(language: UiLanguage, key: &'static str) -> &'static str {
             "already_up_to_date" => "Latest: already up to date.",
             "update_failed" => "Update failed.",
             "workshop_details_failed" => "Failed to load Workshop details",
+            "details_local_fallback" => "This is a friends-only or private item, so online details are unavailable — showing local info instead.",
             "open_workshop_failed" => "Could not open Steam Workshop page",
             "open_profile_failed" => "Could not open Steam profile",
             "open_folder_failed" => "Could not open folder",
